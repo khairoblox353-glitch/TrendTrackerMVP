@@ -1,0 +1,94 @@
+# Trend Tracker MVP — local stack (spec 14, spec 18 step 10).
+#
+# Three services: PostgreSQL, the FastAPI backend and the Next.js frontend.
+# No Kafka, no Redis, no microservices (spec 19.2-19.5).
+#
+#   docker compose up --build
+#   docker compose exec backend python -m app.cli seed
+#
+# The backend runs a single replica because it may host the in-process scheduler
+# (`RUN_SCHEDULER=true`). Two schedulers against one database would duplicate work, so
+# scaling out means setting RUN_SCHEDULER=false and driving ingestion from cron via
+# POST /api/ingestion/run and POST /api/trends/recalculate (R17).
+
+name: trend-tracker
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trend}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trend}
+      POSTGRES_DB: ${POSTGRES_DB:-trend_tracker}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trend} -d ${POSTGRES_DB:-trend_tracker}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://trend:trend@db:5432/trend_tracker}
+      SQL_ECHO: ${SQL_ECHO:-false}
+      APP_NAME: ${APP_NAME:-Trend Tracker API}
+      ENVIRONMENT: ${ENVIRONMENT:-docker}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+
+      TREND_WINDOW_DAYS: ${TREND_WINDOW_DAYS:-7}
+      TREND_HISTORY_DAYS: ${TREND_HISTORY_DAYS:-30}
+      WEIGHT_GROWTH: ${WEIGHT_GROWTH:-0.7}
+      WEIGHT_VOLUME: ${WEIGHT_VOLUME:-0.3}
+      EMERGING_GROWTH_CAP: ${EMERGING_GROWTH_CAP:-3.0}
+      GROWTH_SATURATION: ${GROWTH_SATURATION:-1.0}
+      GROWING_THRESHOLD: ${GROWING_THRESHOLD:-0.20}
+      DECLINING_THRESHOLD: ${DECLINING_THRESHOLD:--0.20}
+
+      CLASSIFICATION_MIN_CONFIDENCE: ${CLASSIFICATION_MIN_CONFIDENCE:-0.55}
+      FALLBACK_TOPIC_NAME: ${FALLBACK_TOPIC_NAME:-Other}
+
+      LLM_ENABLED: ${LLM_ENABLED:-false}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+
+      COLLECTOR_TIMEOUT_SECONDS: ${COLLECTOR_TIMEOUT_SECONDS:-15}
+      COLLECTOR_MAX_ARTICLES_PER_SOURCE: ${COLLECTOR_MAX_ARTICLES_PER_SOURCE:-50}
+
+      RUN_SCHEDULER: ${RUN_SCHEDULER:-false}
+      INGEST_INTERVAL_MINUTES: ${INGEST_INTERVAL_MINUTES:-60}
+      RECALCULATE_INTERVAL_MINUTES: ${RECALCULATE_INTERVAL_MINUTES:-360}
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Baked into the build for prerendering; overridden at runtime below.
+        API_BASE_URL: ${API_BASE_URL:-http://backend:8000}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # Server-side fetches resolve through the compose network.
+      API_BASE_URL: ${API_BASE_URL:-http://backend:8000}
+      NODE_ENV: production
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+
+volumes:
+  pgdata:
