@@ -2,7 +2,8 @@
 
     python -m app.cli init                 # create tables
     python -m app.cli seed                 # taxonomy + demo data + 30 days of snapshots
-    python -m app.cli seed --reset         # rebuild the demo dataset
+    python -m app.cli seed --reset         # rebuild the demo dataset (keeps real data)
+    python -m app.cli seed --reset --include-ingested   # also wipe real ingested data
     python -m app.cli status               # row counts and pending classification
     python -m app.cli ingest               # run the RSS pipeline once
     python -m app.cli recalculate          # recompute trend snapshots
@@ -54,6 +55,7 @@ def command_seed(args: argparse.Namespace) -> int:
             history_days=args.history_days,
             rng_seed=args.seed,
             reset=args.reset,
+            include_ingested=args.include_ingested,
         )
         _emit({"status": "ok", **result.as_dict(), "totals": seed_service.seed_summary(db)})
     finally:
@@ -145,6 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     seed_parser = subparsers.add_parser("seed", help="load taxonomy and demo data")
     seed_parser.add_argument("--reset", action="store_true", help="delete demo data first")
+    seed_parser.add_argument(
+        "--include-ingested",
+        action="store_true",
+        help="with --reset, also delete real ingested articles and snapshots",
+    )
     seed_parser.add_argument("--article-days", type=int, default=seed_service.DEFAULT_ARTICLE_DAYS)
     seed_parser.add_argument("--history-days", type=int, default=seed_service.DEFAULT_HISTORY_DAYS)
     seed_parser.add_argument("--seed", type=int, default=seed_service.DEFAULT_SEED)

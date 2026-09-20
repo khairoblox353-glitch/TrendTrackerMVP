@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -26,12 +26,29 @@ router = APIRouter(tags=["operations"])
 
 
 @router.get("/health", response_model=HealthResponse, summary="Liveness and dependency check")
-def health(db: Session = Depends(get_db)) -> HealthResponse:
+def health(response: Response, db: Session = Depends(get_db)) -> HealthResponse:
+    """Report whether this instance can actually serve traffic (spec 11).
+
+    The probe touches a real table instead of only opening a connection: `SELECT 1`
+    succeeds against an empty database, so it reported "ok" on a fresh volume where
+    every data endpoint returned 503. Querying `categories` makes the signal match
+    what the read endpoints need. `/api/health` is the Docker healthcheck, and the
+    frontend's `depends_on: service_healthy` gates on it, so a false "ok" here hides
+    an unseeded deployment.
+
+    A failing check returns 503, matching the contract in docs/API.md, but still uses
+    the `HealthResponse` envelope so callers always get `status`, `database`,
+    `scheduler`, `llm` and `version`. This handler never raises: a broken database
+    must degrade the response, not turn the endpoint into a 500.
+    """
     try:
-        db.execute(text("SELECT 1"))
+        db.execute(text("SELECT 1 FROM categories LIMIT 1"))
         database = "ok"
     except Exception:  # noqa: BLE001 - health must never raise
         database = "error"
+
+    if database != "ok":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     return HealthResponse(
         status="ok" if database == "ok" else "degraded",

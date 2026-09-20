@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 # Articles whose classification is older than this are eligible for reprocessing.
 REPROCESS_BATCH_SIZE = 50
 
+# Statuses meaning "never successfully classified". Defined once so the query in
+# `pending_articles` and the backlog count in `pending_count` can never disagree.
+PENDING_STATUSES = (ProcessingStatus.PENDING.value, ProcessingStatus.FAILED.value)
+
 
 @dataclass(slots=True)
 class SourceOutcome:
@@ -200,7 +204,11 @@ def save_articles(
             created.append(article)
         except Exception as exc:  # noqa: BLE001 - reported, not raised (spec 15)
             logger.warning("failed to store article %s: %s", payload["url"], exc)
-            warnings.append(f"storage failure: {exc}")
+            # This warning reaches the client through `IngestionSummary.errors`, and the
+            # exception text can carry generated SQL, column names and bound parameter
+            # values (an over-long URL is enough to trigger it). Expose a generic message
+            # and keep the detail in the server log only.
+            warnings.append("storage failure")
             skipped += 1
 
     if created:
@@ -332,6 +340,10 @@ def ingest_source(
             collector = get_collector(source.feed_url, config=config)
         result: FetchResult = collector.collect(source)
     except CollectorError as exc:
+        # CollectorError is our own type and its message is written for operators
+        # ("HTTP 404", "timeout after 15s", "invalid feed"), so it is safe to return to
+        # the client and to store as `last_error` for `cli status`. Unexpected errors are
+        # sanitized instead; see the catch-all in `ingest_all`.
         outcome.error = str(exc)
         source.last_error = str(exc)
         source.last_fetched_at = utcnow()
@@ -425,12 +437,29 @@ def ingest_all(
                 collector=collector,
                 config=config,
             )
-        except Exception as exc:  # noqa: BLE001 - one source must not stop the run
+        except Exception:  # noqa: BLE001 - one source must not stop the run
             db.rollback()
+            # Unlike CollectorError, an unexpected exception may embed SQL, internal
+            # paths or credentials. The client gets a fixed message; the detail is logged
+            # here with a traceback and is never serialized into the response.
             logger.exception("unexpected failure ingesting source %s", source.id)
             outcome = SourceOutcome(
-                source_id=source.id, source_name=source.name, ok=False, error=str(exc)
+                source_id=source.id,
+                source_name=source.name,
+                ok=False,
+                error="unexpected error during ingestion",
             )
+
+        # BUG: the CollectorError branch in `ingest_source` only `flush()`es the
+        # `last_error`/`last_fetched_at` update. Nothing committed it, and `get_db`
+        # closes the request-scoped session with a plain `db.close()`, which rolls the
+        # pending update back. A failure on the last (or only) source of a run was
+        # therefore reported in `summary.errors` but never stored, so `cli status` and
+        # `/api/ingestion/run` disagreed with a fresh session. Committing once per source
+        # makes every outcome durable. This cannot disturb a successful source: it has
+        # already committed its articles before classification and again afterwards, so
+        # this commit is a no-op for it and the spec 15 guarantee is untouched.
+        db.commit()
 
         summary.sources.append(outcome)
         summary.articles_fetched += outcome.fetched
@@ -461,11 +490,7 @@ def pending_articles(db: Session, limit: int = REPROCESS_BATCH_SIZE) -> list[Art
     statement = (
         select(Article)
         .options(selectinload(Article.topics))
-        .where(
-            Article.processing_status.in_(
-                [ProcessingStatus.PENDING.value, ProcessingStatus.FAILED.value]
-            )
-        )
+        .where(Article.processing_status.in_(PENDING_STATUSES))
         .order_by(Article.published_at.desc())
         .limit(limit)
     )
@@ -507,9 +532,7 @@ def pending_count(db: Session) -> int:
     return int(
         db.execute(
             select(func.count(Article.id)).where(
-                Article.processing_status.in_(
-                    [ProcessingStatus.PENDING.value, ProcessingStatus.FAILED.value]
-                )
+                Article.processing_status.in_(PENDING_STATUSES)
             )
         ).scalar_one()
     )

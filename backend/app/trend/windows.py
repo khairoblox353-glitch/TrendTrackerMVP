@@ -28,14 +28,6 @@ class DateWindow:
     previous_start: datetime
     previous_end: datetime
 
-    @property
-    def current_range(self) -> tuple[datetime, datetime]:
-        return (self.current_start, self.current_end)
-
-    @property
-    def previous_range(self) -> tuple[datetime, datetime]:
-        return (self.previous_start, self.previous_end)
-
 
 def _start_of_day(day: date) -> datetime:
     return datetime.combine(day, time.min, tzinfo=UTC)

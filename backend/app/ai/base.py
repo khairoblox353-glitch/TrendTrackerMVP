@@ -30,10 +30,6 @@ class ClassificationResult:
     degraded: bool = False
     error: str | None = None
 
-    @property
-    def is_confident(self) -> bool:
-        return self.topic is not None and self.confidence > 0.0
-
     @classmethod
     def fallback(
         cls,

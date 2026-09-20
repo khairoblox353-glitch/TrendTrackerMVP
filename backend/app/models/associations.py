@@ -9,7 +9,7 @@ from __future__ import annotations
 import decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import ForeignKey, Numeric
+from sqlalchemy import ForeignKey, Index, Numeric
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -21,6 +21,11 @@ if TYPE_CHECKING:
 
 class ArticleTopic(Base):
     __tablename__ = "article_topics"
+    # `topic_id` is only the second column of the composite primary key, so the
+    # primary-key index cannot serve topic-only lookups. Those are hot: the topic
+    # article counts, the latest-articles list on the trend detail page and the
+    # scoring engine all filter by `topic_id` alone.
+    __table_args__ = (Index("ix_article_topics_topic_id", "topic_id"),)
 
     article_id: Mapped[int] = mapped_column(
         ForeignKey("articles.id", ondelete="CASCADE"), primary_key=True

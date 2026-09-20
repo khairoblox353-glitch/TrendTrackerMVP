@@ -33,17 +33,19 @@ export const dynamic = "force-dynamic";
  * (spec 19.9, spec 19.10).
  */
 export default async function HomePage() {
-  const [categoriesResult, trendsResult, articlesResult] = await Promise.all([
+  const [categoriesResult, trendsResult, articlesResult, emergingResult] = await Promise.all([
     getCategories(),
     getTrends({ sort: "-trend_score", page_size: 9 }),
     getArticles({ page_size: 8 }),
+    // Only the envelope count is used; `page_size: 1` keeps the extra request tiny.
+    getTrends({ status: "emerging", page_size: 1 }),
   ]);
 
   const categories = categoriesResult.ok ? categoriesResult.data : [];
   const trends = trendsResult.ok ? trendsResult.data : null;
   const articles = articlesResult.ok ? articlesResult.data : null;
+  const emerging = emergingResult.ok ? emergingResult.data : null;
 
-  const totalArticles = categories.reduce((sum, category) => sum + category.article_count, 0);
   const leading = trends?.items[0];
 
   return (
@@ -53,7 +55,7 @@ export default async function HomePage() {
           <h1 className="text-3xl font-semibold tracking-tight text-white">Trend Tracker</h1>
           <p className="mt-2 max-w-2xl text-slate-400">
             Articles are collected from RSS feeds, classified into topics and scored by
-            growth over the last {leading?.window_days ?? 7} days.
+            the backend from article growth{leading ? ` over the last ${leading.window_days} days` : ""}.
           </p>
         </div>
 
@@ -71,7 +73,7 @@ export default async function HomePage() {
       {trends ? (
         <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <StatCard label="Topics tracked" value={formatCount(trends.total)} />
-          <StatCard label="Articles" value={formatCount(totalArticles)} />
+          <StatCard label="Articles" value={formatCount(articles?.total)} />
           <StatCard
             label="Leading trend"
             value={leading ? formatGrowthPercent(leading.growth_percent) : "—"}
@@ -80,8 +82,8 @@ export default async function HomePage() {
           />
           <StatCard
             label="Emerging topics"
-            value={formatCount(trends.items.filter((trend) => trend.is_emerging).length)}
-            hint={`Out of the top ${trends.items.length} shown`}
+            value={formatCount(emerging?.total)}
+            hint="Across all tracked topics"
           />
         </section>
       ) : null}

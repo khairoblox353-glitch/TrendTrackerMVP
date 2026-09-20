@@ -12,8 +12,20 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models import Article, ArticleTopic, Category, Topic, TrendSnapshot
+from app.models import (
+    Article,
+    ArticleTopic,
+    Category,
+    ProcessingStatus,
+    Source,
+    Topic,
+    TrendSnapshot,
+)
 from app.services import seed as seed_service
+
+# Text a real ingestion/summary job could have produced. It differs from the offline
+# stub wording, so a refresh would visibly overwrite it.
+REAL_SUMMARY = "Real summary generated from ingested articles."
 
 
 class TestSeedAll:
@@ -207,6 +219,142 @@ class TestIdempotency:
         ).scalars().all()
 
         assert first_titles == second_titles
+
+
+class TestSeedPreservesRealData:
+    """A plain run and `seed --reset` must never destroy data ingested from real feeds.
+
+    Seeded articles and real articles share the articles, article_topics and topics
+    tables, so the reset path has to identify demo rows by their URL marker instead of
+    deleting whole tables (findings #1, #4 and #22).
+    """
+
+    def _add_real_article(self, db: Session, topic: Topic) -> int:
+        source = Source(
+            name="Real Feed",
+            url="https://real.example.test",
+            feed_url="https://real.example.test/feed.xml",
+            category_id=topic.category_id,
+        )
+        db.add(source)
+        db.flush()
+
+        article = Article(
+            source_id=source.id,
+            category_id=topic.category_id,
+            title="A real ingested article",
+            url="https://real.example.test/story/1",
+            published_at=datetime.now(UTC),
+            processing_status=ProcessingStatus.CLASSIFIED.value,
+        )
+        db.add(article)
+        db.flush()
+        db.add(ArticleTopic(article_id=article.id, topic_id=topic.id, confidence=0.95))
+        db.commit()
+        return article.id
+
+    def _topic(self, db: Session, slug: str = "ai-agents") -> Topic:
+        return db.execute(select(Topic).where(Topic.slug == slug)).scalar_one()
+
+    def test_reset_keeps_real_articles_and_topic_links(self, db: Session):
+        seed_service.seed_all(db, article_days=20, history_days=5)
+        topic = self._topic(db)
+        article_id = self._add_real_article(db, topic)
+
+        seed_service.seed_all(db, article_days=20, history_days=5, reset=True)
+
+        real = db.get(Article, article_id)
+        assert real is not None, "seed --reset deleted a real ingested article"
+        assert real.source_id is not None
+
+        linked = db.execute(
+            select(ArticleTopic.topic_id).where(ArticleTopic.article_id == article_id)
+        ).scalars().all()
+        assert linked == [topic.id], "seed --reset removed the real article's topic link"
+
+    def test_reset_keeps_the_real_topic_row(self, db: Session):
+        seed_service.seed_all(db, article_days=20, history_days=5)
+        topic = self._topic(db)
+        topic_id = topic.id
+        self._add_real_article(db, topic)
+
+        seed_service.seed_all(db, article_days=20, history_days=5, reset=True)
+
+        # Topics are shared taxonomy: deleting them would cascade into real article links.
+        assert db.get(Topic, topic_id) is not None
+
+    def test_plain_seed_keeps_a_real_topic_summary(self, db: Session):
+        seed_service.seed_all(db, article_days=20, history_days=5)
+        topic = self._topic(db)
+        topic.summary = REAL_SUMMARY
+        db.commit()
+
+        seed_service.seed_all(db, article_days=20, history_days=5)
+
+        db.refresh(topic)
+        assert topic.summary == REAL_SUMMARY
+
+    def test_plain_seed_does_not_rewrite_snapshot_history(self, db: Session):
+        seed_service.seed_all(db, article_days=20, history_days=5)
+        before = self._snapshots(db)
+        assert before
+
+        # A much larger history request would add 25 more days if seeding recalculated
+        # unconditionally, overwriting history that real articles may have produced.
+        seed_service.seed_all(db, article_days=20, history_days=30)
+
+        assert self._snapshots(db) == before
+
+    def test_reset_rebuilds_history_for_the_demo_dataset(self, db: Session):
+        # A reset owns the demo dataset, so history is rebuilt rather than preserved.
+        seed_service.seed_all(db, article_days=20, history_days=5)
+        result = seed_service.seed_all(db, article_days=20, history_days=5, reset=True)
+
+        assert result.snapshots > 0
+        assert result.history_days == 5
+
+    def test_reset_preserves_the_taxonomy(self, db: Session):
+        seed_service.seed_all(db, article_days=20, history_days=5)
+
+        seed_service.seed_all(db, article_days=20, history_days=5, reset=True)
+
+        assert db.execute(select(func.count(Category.id))).scalar_one() == 5
+        counts = seed_service.topic_counts(db)
+        assert counts == {"curated": 20, "fallback": 5, "total": 25}
+
+    def test_full_wipe_requires_an_explicit_opt_in(self, db: Session):
+        seed_service.seed_all(db, article_days=20, history_days=5)
+        topic = self._topic(db)
+        article_id = self._add_real_article(db, topic)
+
+        seed_service.seed_all(
+            db, article_days=20, history_days=5, reset=True, include_ingested=True
+        )
+
+        # The documented opt-in is the only path that removes real articles and, with
+        # them, the whole snapshot table (the reset rebuilds seeded history afterwards).
+        assert db.get(Article, article_id) is None
+        assert db.execute(
+            select(func.count(Article.id)).where(Article.source_id.is_not(None))
+        ).scalar_one() == 0
+
+    @staticmethod
+    def _snapshots(db: Session) -> dict:
+        rows = db.execute(
+            select(
+                TrendSnapshot.topic_id,
+                TrendSnapshot.snapshot_date,
+                TrendSnapshot.window_days,
+                TrendSnapshot.current_count,
+                TrendSnapshot.previous_count,
+                TrendSnapshot.trend_score,
+                TrendSnapshot.status,
+            )
+        ).all()
+        return {
+            (topic_id, day, window): (current, previous, score, status)
+            for topic_id, day, window, current, previous, score, status in rows
+        }
 
 
 class TestSeedSummary:

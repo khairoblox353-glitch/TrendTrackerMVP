@@ -5,7 +5,9 @@ import { STATUS_DESCRIPTIONS, STATUS_LABELS } from "@/lib/format";
  * Status badge.
  *
  * The status is computed by the backend trend engine; this component only maps it to
- * a colour and label (spec 19.10).
+ * a colour and label (spec 19.10). It deliberately does not re-derive the status from
+ * `is_emerging`: the engine already returns `emerging` for those topics, and deriving it
+ * again here could disagree with the list view.
  */
 
 const STYLES: Record<TrendStatusValue, string> = {
@@ -17,21 +19,21 @@ const STYLES: Record<TrendStatusValue, string> = {
 
 export function TrendStatusBadge({
   status,
-  isEmerging = false,
-  showTooltip = true,
 }: {
   status: TrendStatusValue;
+  /**
+   * Accepted so existing callers keep compiling, but deliberately ignored: the engine
+   * already returns `emerging` when `is_emerging` is set, so re-deriving the status here
+   * could make the badge disagree with the API (and with the trend list).
+   */
   isEmerging?: boolean;
-  showTooltip?: boolean;
 }) {
-  const resolved: TrendStatusValue = isEmerging ? "emerging" : status;
-
   return (
     <span
-      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STYLES[resolved]}`}
-      title={showTooltip ? STATUS_DESCRIPTIONS[resolved] : undefined}
+      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STYLES[status]}`}
+      title={STATUS_DESCRIPTIONS[status]}
     >
-      {STATUS_LABELS[resolved]}
+      {STATUS_LABELS[status]}
     </span>
   );
 }

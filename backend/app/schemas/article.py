@@ -28,16 +28,3 @@ class ArticleDetail(ArticleSummary):
     category: CategoryRef | None = None
     topics: list[TopicRef] = Field(default_factory=list)
 
-
-class ArticleListParams(ORMModel):
-    """Documentation-only model describing the article list query (spec 11)."""
-
-    category: str | None = None
-    topic: str | None = None
-    source_id: int | None = None
-    q: str | None = None
-    published_after: str | None = None
-    published_before: str | None = None
-    sort: str | None = None
-    page: int = Field(default=1, ge=1)
-    page_size: int = Field(default=20, ge=1, le=100)

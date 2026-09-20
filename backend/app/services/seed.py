@@ -46,6 +46,12 @@ DEFAULT_SEED = 20260920
 DEFAULT_HISTORY_DAYS = 30
 DEFAULT_ARTICLE_DAYS = 45
 
+# Marker carried by every URL `_unique_url` generates. Seeded articles are identified
+# by this prefix, and both the generator and `reset_demo_data` read the constant, so
+# the marker cannot drift between writing and deleting seeded rows. Real ingested
+# articles always use a real URL, so they never match.
+SEED_URL_PREFIX = "https://seed.trend-tracker.local/"
+
 # Article density per topic per day in a baseline window. At the default 7-day window
 # this rounds to two articles per topic per window, which puts a default run in the
 # 200-300 range: inside the 100-500 the specification asks for, with enough articles per
@@ -343,7 +349,7 @@ def _make_articles(
 
 
 def _unique_url(category_slug: str, topic_slug: str, published_at: datetime, used: set[str]) -> str:
-    base = f"https://seed.trend-tracker.local/{category_slug}/{topic_slug}/{published_at:%Y%m%d%H%M}"
+    base = f"{SEED_URL_PREFIX}{category_slug}/{topic_slug}/{published_at:%Y%m%d%H%M}"
     candidate = base
     suffix = 2
     while candidate in used:
@@ -425,6 +431,40 @@ def seed_history(
     return result.snapshots_written, len(result.dates_processed)
 
 
+def _has_snapshots(db: Session) -> bool:
+    """True when any trend snapshot already exists.
+
+    Distinguishes a fresh database (nothing to lose) from a populated one, where a plain
+    `seed` must not recalculate history that real articles produced.
+    """
+    return db.execute(select(TrendSnapshot.id).limit(1)).first() is not None
+
+
+def _fill_missing_summaries(db: Session, *, classifier: Classifier, config: Settings) -> int:
+    """Generate summaries only for topics that have none yet.
+
+    `refresh_all_summaries` skips a topic when the generated text equals the stored one,
+    but it would still replace a *different* summary, and on a populated database that
+    summary may have come from real articles. Restricting the topic set to
+    `summary IS NULL` keeps a plain `seed` additive while still filling the dashboard on
+    a fresh database.
+    """
+    from app.services.summaries import refresh_topic_summary
+
+    refreshed = 0
+    statement = (
+        select(Topic)
+        .where(Topic.is_fallback.is_(False), Topic.summary.is_(None))
+        .order_by(Topic.id)
+    )
+    for topic in db.execute(statement).scalars():
+        if refresh_topic_summary(db, topic, classifier, config):
+            refreshed += 1
+
+    db.commit()
+    return refreshed
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -438,8 +478,19 @@ def seed_all(
     with_sources: bool = True,
     config: Settings | None = None,
     reset: bool = False,
+    include_ingested: bool = False,
 ) -> SeedResult:
-    """Seed everything in dependency order. Idempotent unless `reset` is set."""
+    """Seed everything in dependency order. Idempotent unless `reset` is set.
+
+    `reset` only removes seeded articles, so `seed --reset` can never destroy real
+    ingested data. Passing `include_ingested=True` additionally wipes real articles and
+    every snapshot; it is an explicit opt-in and defaults to the safe behaviour.
+
+    Seeding is additive once the dataset exists: snapshot history is only rebuilt for a
+    reset or on a database that has no snapshots yet, and summaries are only generated
+    for topics that have none. Both would otherwise overwrite values that real ingested
+    articles produced.
+    """
     from app.services.summaries import refresh_all_summaries
 
     config = config or default_settings
@@ -447,7 +498,7 @@ def seed_all(
     result = SeedResult()
 
     if reset:
-        reset_demo_data(db)
+        reset_demo_data(db, include_ingested=include_ingested)
 
     categories = seed_categories(db)
     result.categories = len(categories)
@@ -470,23 +521,66 @@ def seed_all(
         config=config,
     )
 
-    snapshots, days_processed = seed_history(
-        db, days=history_days, window_days=window_days, config=config
-    )
-    result.snapshots = snapshots
-    result.history_days = days_processed
+    # History is rebuilt on a reset, and on a fresh database where there is nothing to
+    # lose. On a populated database the existing snapshots may have been derived from
+    # real articles, so recalculating every topic from seed data alone would silently
+    # rewrite that history (finding #22).
+    if reset or not _has_snapshots(db):
+        snapshots, days_processed = seed_history(
+            db, days=history_days, window_days=window_days, config=config
+        )
+        result.snapshots = snapshots
+        result.history_days = days_processed
 
-    refresh_all_summaries(db, classifier=OfflineSummarizer(), config=config)
+    # A reset owns the whole demo dataset, so refreshing every summary is correct there.
+    # Otherwise only fill topics that have no summary yet, so text derived from real
+    # articles survives a plain `seed` (finding #4).
+    if reset:
+        refresh_all_summaries(db, classifier=OfflineSummarizer(), config=config)
+    else:
+        _fill_missing_summaries(db, classifier=OfflineSummarizer(), config=config)
 
     return result
 
 
-def reset_demo_data(db: Session) -> None:
-    """Delete seeded articles, topics and snapshots. Sources and categories are kept."""
-    db.execute(TrendSnapshot.__table__.delete())
-    db.execute(ArticleTopic.__table__.delete())
-    db.execute(Article.__table__.delete())
-    db.execute(Topic.__table__.delete())
+def reset_demo_data(db: Session, *, include_ingested: bool = False) -> None:
+    """Delete the seeded demo dataset. Real data and the taxonomy are kept.
+
+    Seeded articles are matched by their URL prefix (`SEED_URL_PREFIX`) rather than by a
+    table-wide delete. Real ingested articles share the `articles`, `article_topics` and
+    `topics` tables with the demo dataset, so the old unconditional deletes destroyed
+    them (finding #1).
+
+    Topics are never deleted: they are a shared taxonomy that real articles link to, and
+    removing a topic cascades into `article_topics`, silently unlinking those articles.
+    Categories and sources are kept for the same reason. Only snapshots whose topic has
+    no articles left are dropped, which is enough to clear the demo history.
+
+    `include_ingested=True` opts into a full wipe of every article and snapshot. It has
+    to be requested explicitly, so the default is non-destructive to real data.
+    """
+    if include_ingested:
+        db.execute(TrendSnapshot.__table__.delete())
+        db.execute(ArticleTopic.__table__.delete())
+        db.execute(Article.__table__.delete())
+        db.commit()
+        return
+
+    seeded_ids = select(Article.id).where(Article.url.startswith(SEED_URL_PREFIX))
+
+    # Links go first: these rows belong to the seeded articles being removed, and SQLite
+    # does not apply the ON DELETE CASCADE unless foreign key enforcement is enabled.
+    db.execute(ArticleTopic.__table__.delete().where(ArticleTopic.article_id.in_(seeded_ids)))
+    db.execute(Article.__table__.delete().where(Article.url.startswith(SEED_URL_PREFIX)))
+
+    # Snapshots are keyed to topics, not to articles, so they cannot be narrowed by URL.
+    # Drop only the snapshots of topics that now have no articles at all: any topic a
+    # real article still links to keeps its history.
+    db.execute(
+        TrendSnapshot.__table__.delete().where(
+            ~TrendSnapshot.topic_id.in_(select(ArticleTopic.topic_id))
+        )
+    )
     db.commit()
 
 

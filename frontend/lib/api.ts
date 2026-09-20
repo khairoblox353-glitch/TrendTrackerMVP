@@ -15,7 +15,6 @@ import type {
   ArticleQuery,
   CategoryDetail,
   CategorySummary,
-  HealthResponse,
   Page,
   TrendDetail,
   TrendHistory,
@@ -152,11 +151,21 @@ export function getArticles(query: ArticleQuery = {}): Promise<ApiResult<Page<Ar
 }
 
 export function getArticle(id: number | string): Promise<ApiResult<ArticleDetail>> {
-  return request<ArticleDetail>(`/articles/${id}`) as Promise<ApiResult<ArticleDetail>>;
-}
+  // The route param is a string, but the API contract is a positive integer. A bad id is
+  // rejected here instead of being interpolated: an unencoded `..` segment would let the
+  // URL normalize past the `/api/articles` prefix on the internal backend host.
+  const numericId = typeof id === "number" ? id : Number(id);
+  if (!Number.isInteger(numericId) || numericId < 1) {
+    return Promise.resolve({
+      ok: false,
+      status: 400,
+      message: `Invalid article id: ${id}`,
+    } satisfies ApiFailure);
+  }
 
-export function getHealth(): Promise<ApiResult<HealthResponse>> {
-  return request<HealthResponse>("/health") as Promise<ApiResult<HealthResponse>>;
+  return request<ArticleDetail>(`/articles/${encodeURIComponent(numericId)}`) as Promise<
+    ApiResult<ArticleDetail>
+  >;
 }
 
 /** Convenience accessor used by pages that must render something on failure. */

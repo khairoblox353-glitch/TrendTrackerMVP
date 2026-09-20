@@ -14,8 +14,9 @@ import { formatCount, formatDate, formatGrowthPercent, formatScore } from "@/lib
 /**
  * Trend detail page (spec 12): `/trends/ai-agents`.
  *
- * Shows the score, growth, article counts, the 7/30-day history chart, the newest
- * articles and the AI-generated summary. Every number is computed by the backend.
+ * Shows the score, growth, article counts, the history chart (drawn over the window the
+ * API reports), the newest articles and the AI-generated summary. Every number is
+ * computed by the backend.
  */
 export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -73,7 +74,7 @@ export default async function TrendDetailPage({ params }: { params: Promise<{ sl
               <p className="mt-2 max-w-2xl text-slate-400">{trend.description}</p>
             ) : null}
           </div>
-          <TrendStatusBadge status={trend.status} isEmerging={trend.is_emerging} />
+          <TrendStatusBadge status={trend.status} />
         </div>
       </section>
 
@@ -111,9 +112,18 @@ export default async function TrendDetailPage({ params }: { params: Promise<{ sl
           />
         ) : (
           <div className="card">
-            <GrowthChart points={history.points} metric="growth_rate" />
+            <GrowthChart
+              points={history.points}
+              windowDays={history.window_days}
+              metric="growth_rate"
+            />
             <div className="mt-6 border-t border-white/5 pt-4">
-              <GrowthChart points={history.points} metric="current_count" height={160} />
+              <GrowthChart
+                points={history.points}
+                windowDays={history.window_days}
+                metric="current_count"
+                height={160}
+              />
             </div>
           </div>
         )}

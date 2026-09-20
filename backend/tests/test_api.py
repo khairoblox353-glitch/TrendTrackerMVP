@@ -6,7 +6,7 @@ and the operational endpoints.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -86,6 +86,42 @@ class TestHealth:
         body = response.json()
         assert body["status"] == "ok"
         assert body["database"] == "ok"
+        assert body["scheduler"] == "disabled"
+        assert body["llm"] == "fallback"
+
+    def test_health_is_ok_when_the_schema_is_present(self, client: TestClient):
+        # The session fixture has already created every table, so the health probe
+        # (`SELECT 1 FROM categories LIMIT 1`) must succeed and the endpoint must
+        # report 200 with the complete envelope.
+        response = client.get("/api/health")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert set(body) == {"status", "database", "scheduler", "llm", "version"}
+        assert body["status"] == "ok"
+        assert body["database"] == "ok"
+        assert body["version"]
+
+    def test_health_returns_503_when_the_database_check_fails(
+        self, client: TestClient, db: Session, monkeypatch
+    ):
+        # `docs/API.md` documents 503 + `{"status": "degraded", "database": "error"}`
+        # when the database check fails, and the Docker healthcheck (and the
+        # frontend's `depends_on: service_healthy`) gates on this endpoint. Force the
+        # probe to fail: the endpoint must degrade, not raise a 500, and must still
+        # return the whole envelope so a client can always parse the response.
+        def failing_execute(*args, **kwargs):
+            raise RuntimeError("simulated database outage")
+
+        monkeypatch.setattr(db, "execute", failing_execute, raising=False)
+
+        response = client.get("/api/health")
+
+        assert response.status_code == 503
+        body = response.json()
+        assert set(body) == {"status", "database", "scheduler", "llm", "version"}
+        assert body["status"] == "degraded"
+        assert body["database"] == "error"
         assert body["scheduler"] == "disabled"
         assert body["llm"] == "fallback"
 
@@ -512,3 +548,225 @@ class TestErrorEnvelope:
         response = client.delete("/api/trends")
         assert response.status_code == 405
         assert response.json()["error"]["code"] == "method_not_allowed"
+
+
+class TestArticleDateFilterBoundaries:
+    """Regression guard for #13: the date filters stay index-friendly and inclusive.
+
+    The filters used to wrap the indexed column in `func.date()`, which is not
+    sargable. They now compare the raw column against UTC datetimes, so these tests pin
+    the day boundaries that the rewrite must preserve exactly.
+    """
+
+    @staticmethod
+    def _seed_boundaries(db: Session) -> dict:
+        day = date(2026, 1, 15)
+        articles = {
+            "prev_day_end": make_article(
+                db,
+                title="Just before the window",
+                url="https://example.test/boundary-prev-day",
+                published_at=datetime(2026, 1, 14, 23, 59, 59, tzinfo=UTC),
+            ),
+            "start_of_day": make_article(
+                db,
+                title="Exactly midnight UTC",
+                url="https://example.test/boundary-start",
+                published_at=datetime.combine(day, datetime.min.time(), tzinfo=UTC),
+            ),
+            "midday": make_article(
+                db,
+                title="Middle of the day",
+                url="https://example.test/boundary-midday",
+                published_at=datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
+            ),
+            "next_day_start": make_article(
+                db,
+                title="Midnight at the far boundary",
+                url="https://example.test/boundary-next-day",
+                published_at=datetime(2026, 1, 16, 0, 0, 0, tzinfo=UTC),
+            ),
+        }
+        db.commit()
+        return articles
+
+    def test_published_after_includes_its_own_midnight(self, client: TestClient, db: Session):
+        articles = self._seed_boundaries(db)
+
+        body = client.get(
+            "/api/articles", params={"published_after": "2026-01-15", "page_size": 100}
+        ).json()
+        ids = {item["id"] for item in body["items"]}
+
+        assert articles["start_of_day"].id in ids
+        assert articles["midday"].id in ids
+        assert articles["next_day_start"].id in ids
+        assert articles["prev_day_end"].id not in ids
+        assert body["total"] == 3
+
+    def test_published_before_includes_its_own_midnight(self, client: TestClient, db: Session):
+        articles = self._seed_boundaries(db)
+
+        body = client.get(
+            "/api/articles", params={"published_before": "2026-01-15", "page_size": 100}
+        ).json()
+        ids = {item["id"] for item in body["items"]}
+
+        assert articles["start_of_day"].id in ids
+        assert articles["midday"].id in ids
+        assert articles["prev_day_end"].id in ids
+        # 2026-01-16 00:00:00 is the first instant *after* the inclusive boundary.
+        assert articles["next_day_start"].id not in ids
+        assert body["total"] == 3
+
+    def test_single_day_range_covers_both_midnights(self, client: TestClient, db: Session):
+        articles = self._seed_boundaries(db)
+
+        body = client.get(
+            "/api/articles",
+            params={
+                "published_after": "2026-01-15",
+                "published_before": "2026-01-15",
+                "page_size": 100,
+            },
+        ).json()
+        ids = {item["id"] for item in body["items"]}
+
+        assert ids == {articles["start_of_day"].id, articles["midday"].id}
+        assert body["total"] == 2
+
+
+class TestCategoryLeaderLookup:
+    """#11: the per-category leader rewrite must not change the API results."""
+
+    def test_trending_topic_is_the_highest_scored_topic_of_its_category(
+        self, client: TestClient, seeded
+    ):
+        categories = {item["slug"]: item for item in client.get("/api/categories").json()}
+        # `/api/trends` defaults to `trend_score DESC, topic_id ASC`; the first row of a
+        # category is therefore the leader the category payload must report.
+        expected: dict[str, dict] = {}
+        for item in client.get("/api/trends", params={"page_size": 100}).json()["items"]:
+            expected.setdefault(item["category"]["slug"], item)
+
+        assert categories["ai"]["trending_topic"]["slug"] == "ai-agents"
+        for slug, leader in expected.items():
+            reported = categories[slug]["trending_topic"]
+            assert reported["slug"] == leader["slug"]
+            assert reported["trend_score"] == pytest.approx(leader["trend_score"])
+            assert reported["status"] == leader["status"]
+            assert reported["growth_rate"] == pytest.approx(leader["growth_rate"])
+
+        for slug, category in categories.items():
+            if slug not in expected:
+                assert category["trending_topic"] is None
+
+    def test_category_detail_top_trends_are_descending(self, client: TestClient, seeded):
+        body = client.get("/api/categories/ai").json()
+
+        assert body["top_trends"]
+        scores = [item["trend_score"] for item in body["top_trends"]]
+        assert scores == sorted(scores, reverse=True)
+        assert body["trending_topic"]["slug"] == body["top_trends"][0]["slug"]
+
+    def test_category_detail_matches_the_list_summary(self, client: TestClient, seeded):
+        # `get_category` no longer builds every category summary, so its single-category
+        # payload must still equal the matching entry of `GET /api/categories`.
+        listed = next(item for item in client.get("/api/categories").json() if item["slug"] == "ai")
+        detail = client.get("/api/categories/ai").json()
+
+        assert detail["id"] == listed["id"]
+        assert detail["name"] == listed["name"]
+        assert detail["description"] == listed["description"]
+        assert detail["topic_count"] == listed["topic_count"]
+        assert detail["article_count"] == listed["article_count"]
+        assert detail["trending_topic"] == listed["trending_topic"]
+
+
+class TestCategoryFilterEquivalence:
+    """#20: slug and name spellings of `category` must stay interchangeable."""
+
+    def test_all_spellings_match_the_same_categories(self, client: TestClient, seeded):
+        trend_totals: set[int] = set()
+        article_totals: set[int] = set()
+        trend_slugs: list[set[str]] = []
+        article_ids: list[set[int]] = []
+
+        for value in ("ai", "AI", "  AI  "):
+            trends = client.get(
+                "/api/trends", params={"category": value, "page_size": 100}
+            ).json()
+            articles = client.get(
+                "/api/articles", params={"category": value, "page_size": 100}
+            ).json()
+
+            assert trends["total"] > 0, value
+            assert articles["total"] > 0, value
+
+            trend_totals.add(trends["total"])
+            article_totals.add(articles["total"])
+            trend_slugs.append({item["slug"] for item in trends["items"]})
+            article_ids.append({item["id"] for item in articles["items"]})
+
+        assert len(trend_totals) == 1
+        assert len(article_totals) == 1
+        assert trend_slugs[0] == trend_slugs[1] == trend_slugs[2]
+        assert article_ids[0] == article_ids[1] == article_ids[2]
+
+
+class TestTrendDetailEagerLoading:
+    """#10: serializing a trend detail must not lazy-load per article."""
+
+    def test_articles_for_topic_eager_loads_relationships(self, db: Session, seeded):
+        from sqlalchemy import event, inspect
+
+        from app.database import engine
+        from app.services import trends as trend_service
+
+        db.expire_all()
+        emitted: list[str] = []
+
+        def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+            emitted.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            articles = trend_service.articles_for_topic(db, seeded["agents"].id, limit=5)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+
+        assert len(articles) == 5
+        # `article_as_dict` touches exactly these three relationships; the un-eager-loaded
+        # version left them unloaded, so serialization emitted one SELECT per row each.
+        for article in articles:
+            unloaded = set(inspect(article).unloaded)
+            assert unloaded.isdisjoint({"source", "category", "topics"}), unloaded
+
+        selects = [statement for statement in emitted if statement.lstrip().upper().startswith("SELECT")]
+        # One SELECT for the articles plus one per selectinload relationship (source,
+        # category, topics); without eager loading this was 1 + 3 per article.
+        assert len(selects) <= 4, selects
+
+    def test_trend_detail_endpoint_does_not_lazy_load_per_article(
+        self, client: TestClient, db: Session, seeded
+    ):
+        from sqlalchemy import event
+
+        from app.database import engine
+
+        db.expire_all()
+        emitted: list[str] = []
+
+        def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+            emitted.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            assert client.get("/api/trends/ai-agents").status_code == 200
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+
+        selects = [statement for statement in emitted if statement.lstrip().upper().startswith("SELECT")]
+        # Snapshot/topic lookup, article page, and one selectinload query per
+        # relationship; a regression to lazy loading would push this past 10.
+        assert len(selects) <= 6, selects

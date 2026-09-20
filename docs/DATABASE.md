@@ -189,6 +189,7 @@ UNIQUE  topics(slug)
 UNIQUE  topics(category_id, name_normalized)
 UNIQUE  trend_snapshots(topic_id, snapshot_date, window_days)
 PK      article_topics(article_id, topic_id)
+INDEX   article_topics(topic_id)          -- topic-only lookups; not served by the PK index
 
 INDEX   articles(published_at DESC)
 INDEX   articles(category_id, published_at DESC)
@@ -203,11 +204,34 @@ Why these specifically:
 
 * `articles(url)` unique — dedupe (spec §7, §15).
 * `articles(published_at DESC)` — every window query and the article list ordered by recency.
+  The `published_after` / `published_before` filters compare the raw column against
+  timezone-aware UTC bounds (`>= D 00:00Z`, `< D+1 00:00Z`) rather than wrapping it in
+  `date(...)`, so the same index serves the range and the predicate stays sargable.
+  Semantics are unchanged: both bounds are inclusive of the whole day.
 * `(category_id, published_at DESC)` — category page and per-category trend counts.
 * Partial index on the reprocess queue — only unclassified rows are ever scanned by
   `POST /api/classify/pending`-style work, so the index stays small as the table grows.
 * `trend_snapshots` unique — makes `POST /api/trends/recalculate` safely repeatable.
 * `trend_snapshots(snapshot_date DESC)` — "latest snapshot per topic" is the hottest read.
+* `article_topics(topic_id)` — a topic id is only the *second* column of the composite
+  primary key, so the primary-key index cannot serve a topic-only lookup. Those are hot:
+  the topic article counts, the latest-articles list on the trend detail page and the
+  scoring engine all filter by `topic_id` alone.
+
+## Applying schema changes to an existing database
+
+There is no migration framework, deliberately (no Alembic; `create_all` only). A fresh
+volume gets every table and index above automatically, but `create_all` never ALTERs a
+table that already exists, so an index added after the first release does not reach a
+database that already holds the old schema. Apply it by hand:
+
+```sql
+CREATE INDEX IF NOT EXISTS ix_article_topics_topic_id ON article_topics (topic_id);
+```
+
+The statement is idempotent, so it is safe to run on every database. Verify afterwards
+with `\d article_topics` (psql) or
+`SELECT indexname FROM pg_indexes WHERE tablename = 'article_topics';`.
 
 ## Query pattern for "latest snapshot per topic"
 

@@ -32,18 +32,3 @@ class Page(BaseModel, Generic[T]):
         pages = (total + page_size - 1) // page_size if page_size else 0
         return cls(items=items, total=total, page=page, page_size=page_size, pages=pages)
 
-
-class ErrorDetail(BaseModel):
-    code: str
-    message: str
-    details: dict | None = None
-
-
-class ErrorResponse(BaseModel):
-    """Uniform error envelope produced by the exception handlers (spec 11)."""
-
-    error: ErrorDetail
-
-
-class MessageResponse(BaseModel):
-    message: str

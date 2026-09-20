@@ -82,12 +82,19 @@ export const STATUS_LABELS = {
   declining: "Declining",
 } as const;
 
-/** Long description of each status, shown as a tooltip. */
+/**
+ * Long description of each status, shown as a tooltip.
+ *
+ * The exact boundaries are backend configuration (`growing_threshold` /
+ * `declining_threshold`) and can be overridden per deployment, so the wording must not
+ * name a percentage: a tooltip that claims "20%" would contradict the API whenever the
+ * thresholds are tuned.
+ */
 export const STATUS_DESCRIPTIONS = {
   emerging: "No articles in the previous period, and new activity now.",
-  growing: "Publishing at least 20% more than the previous period.",
-  stable: "Within 20% of the previous period.",
-  declining: "Publishing at least 20% less than the previous period.",
+  growing: "Publishing more than the previous period.",
+  stable: "Publishing about as much as the previous period.",
+  declining: "Publishing less than the previous period.",
 } as const;
 
 /** Clamp a 0..1 ratio into a percentage width for the volume bars. */

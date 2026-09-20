@@ -41,11 +41,25 @@ Every failure returns the same shape, produced by handlers in `app/api/errors.py
 | HTTP | `code` | When |
 |---|---|---|
 | 404 | `not_found` | Unknown category / topic / article |
+| 405 | `method_not_allowed` | Wrong HTTP method for the path |
 | 422 | `validation_error` | Bad query or body value, including bad `sort` |
-| 409 | `conflict` | Duplicate seed run into a non-empty database |
-| 502 | `upstream_error` | Collector / LLM transport failure surfaced by an admin endpoint |
-| 503 | `unavailable` | Database unreachable |
+| 503 | `unavailable` | Database unreachable (a `SQLAlchemyError` reached the handler) |
 | 500 | `internal_error` | Unhandled exception (never leaks a traceback) |
+
+`app/api/errors.py` defines only the `AppError` subclasses a route actually raises:
+`NotFoundError` (404) and `ValidationError` (422). The remaining rows come from generic
+handlers rather than from a route: `method_not_allowed` (405) and `unavailable` (503) from
+the Starlette `HTTPException`/`SQLAlchemyError` handlers, and `internal_error` (500) from
+the catch-all `Exception` handler. A code the handler map defines but that no endpoint can reach today
+(`409 conflict`) is deliberately not listed as contract. `GET /api/health` is the one
+deliberate exception: it answers `503` with the health envelope above rather than this error
+shape, so a health probe can always parse it.
+
+The handlers never put a raw exception into the body: the 500 handler replaces the text
+with `An unexpected error occurred` and only logs the traceback server-side, and the
+database handler reports `The database is unavailable`. Where a message is returned
+verbatim it is deliberately our own operator-facing text, never a driver, SQL or library
+message - see the ingestion rules below.
 
 Validation failures keep FastAPI's native `detail` list inside `error.details.fields` so
 clients can map messages to inputs.
@@ -150,7 +164,7 @@ yet: `204 No Content` rather than `404`.
 
 | query | type | default |
 |---|---|---|
-| `days` | int 1–365 | `30` |
+| `days` | int 1–365 | the configured `TREND_HISTORY_DAYS` (env, default `30`) |
 | `window_days` | int 1–90 | the topic's most recent window |
 
 ```json
@@ -168,6 +182,10 @@ yet: `204 No Content` rather than `404`.
 `404 not_found` when the slug is unknown. `204 No Content` when the topic exists but has no
 snapshots yet — the difference matters, because a page should say "not scored yet" for the
 latter and "no such trend" for the former.
+
+`days` is optional: when it is omitted the service uses the configured `TREND_HISTORY_DAYS`
+instead of a hard-coded 30, so a deployment that widens its history gets wider charts
+without a code change. Supplying it is still validated to `1..365`.
 
 ### `GET /api/articles`
 | query | type | notes |
@@ -213,7 +231,19 @@ Single article as above, or `404 not_found`.
 ```json
 {"status": "ok", "database": "ok", "scheduler": "disabled", "llm": "fallback", "version": "0.1.0"}
 ```
-Returns `503` with `{"status":"degraded","database":"error"}` when the DB check fails.
+
+The probe runs a real query against the `categories` table
+(`SELECT 1 FROM categories LIMIT 1`), not a bare connectivity check: `SELECT 1` succeeds
+against an empty database, which previously reported `ok` on a fresh volume where every
+data endpoint failed. When the probe raises, the endpoint returns **`503`** with the full
+envelope:
+
+```json
+{"status": "degraded", "database": "error", "scheduler": "disabled", "llm": "fallback", "version": "0.1.0"}
+```
+
+The handler never raises, so a broken database degrades the response instead of turning
+the endpoint into a 500; `status` and `database` are the only fields that change.
 
 ### `POST /api/ingestion/run`
 Fetch every active source, dedupe, store, then classify. Blocking; returns a summary.
@@ -236,6 +266,13 @@ Optional body: `{"source_ids": [1,2], "limit_per_source": 50, "classify": true}`
 not fail the request (spec §15). `articles_skipped` counts entries rejected by validation,
 for example a missing title, a non-http URL or a year-old publication date.
 
+Messages in `errors` are chosen deliberately. A collector failure is our own
+`CollectorError` text written for operators (`HTTP 404`, `timeout after 15s`, `invalid
+feed`), and an unexpected exception is replaced with the fixed string `unexpected error
+during ingestion`. An article that cannot be stored is reported as `storage failure`; the
+driver message, SQL and bound parameters stay in the server log. No response ever carries
+raw exception text.
+
 ### `POST /api/trends/recalculate`
 Recompute snapshots for a date range and upsert them.
 
@@ -246,6 +283,13 @@ Recompute snapshots for a date range and upsert them.
 Optional body: `{"snapshot_date": "...", "window_days": 7, "days_back": 1, "topic_id": 3}`.
 `days_back` (1–90) recomputes a trailing range, which is how the seed script builds history.
 Until snapshots exist for a date, `GET /api/trends` returns an empty list rather than an error.
+
+The write is an atomic upsert keyed on `(topic_id, snapshot_date, window_days)`, so the
+endpoint is safely repeatable and two overlapping runs (the 6-hourly job against a manual
+call) cannot collide. `topic_id` narrows which topics are scored, but not how a score is
+computed: `volume_share` is always normalized against the busiest topic of the whole
+population, so a scoped run writes the same value a full run would have written. A
+`topic_id` that does not exist is `422`.
 
 ## Frontend contract notes
 

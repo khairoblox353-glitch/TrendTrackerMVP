@@ -12,15 +12,13 @@ import { useState } from "react";
 export function SearchBox({
   basePath,
   placeholder = "Search trends…",
-  paramName = "q",
 }: {
   basePath: string;
   placeholder?: string;
-  paramName?: string;
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [value, setValue] = useState(searchParams.get(paramName) ?? "");
+  const [value, setValue] = useState(searchParams.get("q") ?? "");
 
   return (
     <form
@@ -30,9 +28,9 @@ export function SearchBox({
         const params = new URLSearchParams(searchParams.toString());
         const trimmed = value.trim();
         if (trimmed) {
-          params.set(paramName, trimmed);
+          params.set("q", trimmed);
         } else {
-          params.delete(paramName);
+          params.delete("q");
         }
         params.delete("page");
         const suffix = params.toString();

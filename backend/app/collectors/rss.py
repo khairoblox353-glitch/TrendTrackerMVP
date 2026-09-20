@@ -216,9 +216,6 @@ class RSSCollector(Collector):
                     continue
         return None
 
-    def extract_published(self, entry) -> datetime | None:
-        return self._extract_published(entry)
-
 
 def clamp_published_at(
     published_at: datetime | None, now: datetime | None = None

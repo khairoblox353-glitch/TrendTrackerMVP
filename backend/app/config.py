@@ -23,7 +23,6 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Trend Tracker API"
-    environment: str = "development"
     # Deliberately not called `debug`: a generic DEBUG variable is commonly set in
     # developer environments (and is here) and would collide with this setting.
     app_debug: bool = False
@@ -52,7 +51,6 @@ class Settings(BaseSettings):
 
     # ---- Trend status thresholds (spec 10) -----------------------------
     growing_threshold: float = Field(default=0.20)
-    emerging_threshold: float = Field(default=1.00)
     declining_threshold: float = Field(default=-0.20)
 
     # ---- Classification (spec 8) ---------------------------------------

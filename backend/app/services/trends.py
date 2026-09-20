@@ -10,12 +10,11 @@ of stored articles (ADR-002).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 
 from sqlalchemy import Select, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import Settings
 from app.config import settings as default_settings
@@ -40,6 +39,31 @@ ARTICLE_SORT_FIELDS: dict[str, object] = {
 
 DEFAULT_TREND_SORT = "trend_score"
 DEFAULT_ARTICLE_SORT = "published_at"
+
+# Eager loading for article serialization, defined once and reused by the article
+# service. Without it, `article_as_dict` lazy-loads `source`, `category` and `topics`
+# for every row, so a five-article trend detail response becomes a burst of queries.
+ARTICLE_EAGER_OPTIONS = (
+    selectinload(Article.source),
+    selectinload(Article.category),
+    selectinload(Article.topics),
+)
+
+
+def apply_category_filter(statement: Select, category: str) -> Select:
+    """Restrict a statement to one category, given its slug or its name.
+
+    The single definition of the "category slug or name" rule, shared by every read
+    path. The caller must already have `Category` joined. Accepts a slug (`ai`) or a
+    name in any case with surrounding whitespace (`AI`, `ai`, `  AI  `).
+    """
+    normalized = normalize_name(category)
+    return statement.where(
+        or_(
+            Category.slug == normalized.replace(" ", "-"),
+            func.lower(Category.name) == normalized,
+        )
+    )
 
 
 @dataclass(slots=True)
@@ -141,10 +165,7 @@ def _apply_trend_filters(
     if not include_fallback:
         statement = statement.where(Topic.is_fallback.is_(False))
     if category:
-        needle = normalize_name(category).replace(" ", "-")
-        statement = statement.where(
-            or_(Category.slug == needle, func.lower(Category.name) == category.strip().lower())
-        )
+        statement = apply_category_filter(statement, category)
     if status:
         statement = statement.where(TrendSnapshot.status == status.strip().lower())
     if query:
@@ -176,6 +197,37 @@ def _to_row(snapshot: TrendSnapshot, topic: Topic, category: Category) -> TrendR
     )
 
 
+def _filtered_trend_query(
+    window_days: int,
+    *,
+    category: str | None = None,
+    status: str | None = None,
+    query: str | None = None,
+    min_growth: float | None = None,
+    include_fallback: bool = False,
+) -> Select:
+    return _apply_trend_filters(
+        _base_trend_query(window_days),
+        category=category,
+        status=status,
+        query=query,
+        min_growth=min_growth,
+        include_fallback=include_fallback,
+    )
+
+
+def _fetch_trend_rows(
+    db: Session, statement: Select, *, sort: str | None, page: int, page_size: int
+) -> list[TrendRow]:
+    column, descending = parse_sort(sort, TREND_SORT_FIELDS, DEFAULT_TREND_SORT)
+    rows = db.execute(
+        statement.order_by(column.desc() if descending else column.asc(), Topic.id.asc())
+        .offset(max(page - 1, 0) * page_size)
+        .limit(page_size)
+    ).all()
+    return [_to_row(snapshot, topic, category) for snapshot, topic, category in rows]
+
+
 def query_trends(
     db: Session,
     *,
@@ -198,42 +250,65 @@ def query_trends(
     cfg = cfg or default_settings
     resolved_window = window_days or cfg.trend_window_days
 
-    statement = _apply_trend_filters(
-        _base_trend_query(resolved_window),
+    statement = _filtered_trend_query(
+        resolved_window,
         category=category,
         status=status,
         query=query,
         min_growth=min_growth,
         include_fallback=include_fallback,
     )
-
-    count_statement = _apply_trend_filters(
-        _base_trend_query(resolved_window).with_only_columns(func.count()).order_by(None),
+    count_statement = _filtered_trend_query(
+        resolved_window,
         category=category,
         status=status,
         query=query,
         min_growth=min_growth,
         include_fallback=include_fallback,
-    )
+    ).with_only_columns(func.count()).order_by(None)
 
-    column, descending = parse_sort(sort, TREND_SORT_FIELDS, DEFAULT_TREND_SORT)
     total = int(db.execute(count_statement).scalar_one())
+    rows = _fetch_trend_rows(db, statement, sort=sort, page=page, page_size=page_size)
+    return rows, total
 
-    rows = db.execute(
-        statement.order_by(column.desc() if descending else column.asc(), Topic.id.asc())
-        .offset(max(page - 1, 0) * page_size)
-        .limit(page_size)
-    ).all()
 
-    return [_to_row(snapshot, topic, category) for snapshot, topic, category in rows], total
+def query_trend_rows(
+    db: Session,
+    *,
+    category: str | None = None,
+    status: str | None = None,
+    query: str | None = None,
+    min_growth: float | None = None,
+    sort: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    window_days: int | None = None,
+    include_fallback: bool = False,
+    cfg: Settings | None = None,
+) -> list[TrendRow]:
+    """The rows of `query_trends` without paying for the COUNT query.
+
+    Callers that only need rows (the per-category leader lookup, `top_trends`) must not
+    execute an aggregate whose result they discard.
+    """
+    cfg = cfg or default_settings
+    resolved_window = window_days or cfg.trend_window_days
+    statement = _filtered_trend_query(
+        resolved_window,
+        category=category,
+        status=status,
+        query=query,
+        min_growth=min_growth,
+        include_fallback=include_fallback,
+    )
+    return _fetch_trend_rows(db, statement, sort=sort, page=page, page_size=page_size)
 
 
 def top_trends(
     db: Session, limit: int = 10, category: str | None = None, cfg: Settings | None = None
 ) -> list[TrendRow]:
     """Highest-scoring trends, optionally limited to one category."""
-    rows, _ = query_trends(db, category=category, page=1, page_size=limit, cfg=cfg)
-    return rows
+    return query_trend_rows(db, category=category, page=1, page_size=limit, cfg=cfg)
 
 
 def get_trend(db: Session, slug: str, cfg: Settings | None = None) -> TrendRow | None:
@@ -289,12 +364,83 @@ def get_history(
     )
 
 
-def category_summaries(db: Session, cfg: Settings | None = None) -> list[dict]:
-    """Category list with article/topic counts and the current leading trend."""
+def _row_from_mapping(row) -> TrendRow:
+    """Build a `TrendRow` from an explicitly selected column mapping."""
+    return TrendRow(
+        topic_id=row["topic_id"],
+        slug=row["slug"],
+        name=row["name"],
+        topic_description=row["topic_description"],
+        topic_summary=row["topic_summary"],
+        category_id=row["category_id"],
+        category_slug=row["category_slug"],
+        category_name=row["category_name"],
+        snapshot_date=row["snapshot_date"],
+        window_days=row["window_days"],
+        current_count=row["current_count"],
+        previous_count=row["previous_count"],
+        growth_rate=row["growth_rate"],
+        volume_share=row["volume_share"],
+        trend_score=row["trend_score"],
+        status=row["status"],
+        is_emerging=bool(row["is_emerging"]),
+    )
+
+
+def _category_leaders(
+    db: Session, cfg: Settings | None = None, *, category_id: int | None = None
+) -> dict[int, TrendRow]:
+    """The highest-scoring topic per category, in a single query.
+
+    Instead of materializing the whole topic population and picking the first row per
+    category in Python, the filtered trend query is ranked with `row_number()`
+    partitioned by category and only rank 1 survives. Window functions work on both
+    PostgreSQL and SQLite (3.25+), so the API tests exercise the same query shape that
+    production runs. The ordering mirrors the default trend sort
+    (`trend_score DESC, topic_id ASC`), so the leader is unchanged.
+    """
     cfg = cfg or default_settings
 
-    categories = list(db.execute(select(Category).order_by(Category.id)).scalars())
+    statement = _filtered_trend_query(cfg.trend_window_days)
+    if category_id is not None:
+        statement = statement.where(Topic.category_id == category_id)
 
+    ranked = (
+        statement.with_only_columns(
+            Topic.id.label("topic_id"),
+            Topic.slug.label("slug"),
+            Topic.name.label("name"),
+            Topic.description.label("topic_description"),
+            Topic.summary.label("topic_summary"),
+            Category.id.label("category_id"),
+            Category.slug.label("category_slug"),
+            Category.name.label("category_name"),
+            TrendSnapshot.snapshot_date.label("snapshot_date"),
+            TrendSnapshot.window_days.label("window_days"),
+            TrendSnapshot.current_count.label("current_count"),
+            TrendSnapshot.previous_count.label("previous_count"),
+            TrendSnapshot.growth_rate.label("growth_rate"),
+            TrendSnapshot.volume_share.label("volume_share"),
+            TrendSnapshot.trend_score.label("trend_score"),
+            TrendSnapshot.status.label("status"),
+            TrendSnapshot.is_emerging.label("is_emerging"),
+        )
+        .add_columns(
+            func.row_number()
+            .over(
+                partition_by=Topic.category_id,
+                order_by=(TrendSnapshot.trend_score.desc(), Topic.id.asc()),
+            )
+            .label("category_rank")
+        )
+        .subquery("category_ranked")
+    )
+
+    rows = db.execute(select(ranked).where(ranked.c.category_rank == 1)).mappings().all()
+    return {row["category_id"]: _row_from_mapping(row) for row in rows}
+
+
+def _category_counts(db: Session) -> tuple[dict[int, int], dict[int, int]]:
     topic_counts = dict(
         db.execute(
             select(Topic.category_id, func.count(Topic.id))
@@ -309,46 +455,68 @@ def category_summaries(db: Session, cfg: Settings | None = None) -> list[dict]:
             .group_by(Article.category_id)
         ).all()
     )
+    return topic_counts, article_counts
 
-    leaders: dict[int, TrendRow] = {}
-    rows, _ = query_trends(db, page=1, page_size=1000, cfg=cfg)
-    for row in rows:
-        leaders.setdefault(row.category_id, row)
 
-    summaries = []
-    for category in categories:
-        leader = leaders.get(category.id)
-        summaries.append(
-            {
-                "id": category.id,
-                "name": category.name,
-                "slug": category.slug,
-                "description": category.description,
-                "topic_count": int(topic_counts.get(category.id, 0)),
-                "article_count": int(article_counts.get(category.id, 0)),
-                "trending_topic": {
-                    "slug": leader.slug,
-                    "name": leader.name,
-                    "growth_rate": leader.growth_rate,
-                    "trend_score": leader.trend_score,
-                    "status": leader.status,
-                }
-                if leader
-                else None,
-            }
+def _category_summary(
+    category: Category, topic_count: int, article_count: int, leader: TrendRow | None
+) -> dict:
+    return {
+        "id": category.id,
+        "name": category.name,
+        "slug": category.slug,
+        "description": category.description,
+        "topic_count": int(topic_count),
+        "article_count": int(article_count),
+        "trending_topic": {
+            "slug": leader.slug,
+            "name": leader.name,
+            "growth_rate": leader.growth_rate,
+            "trend_score": leader.trend_score,
+            "status": leader.status,
+        }
+        if leader
+        else None,
+    }
+
+
+def category_summaries(db: Session, cfg: Settings | None = None) -> list[dict]:
+    """Category list with article/topic counts and the current leading trend."""
+    categories = list(db.execute(select(Category).order_by(Category.id)).scalars())
+    topic_counts, article_counts = _category_counts(db)
+    leaders = _category_leaders(db, cfg)
+
+    return [
+        _category_summary(
+            category,
+            topic_counts.get(category.id, 0),
+            article_counts.get(category.id, 0),
+            leaders.get(category.id),
         )
-    return summaries
+        for category in categories
+    ]
 
 
 def get_category(db: Session, slug: str, cfg: Settings | None = None) -> dict | None:
-    """One category with its top trends, for `GET /api/categories/{slug}`."""
+    """One category with its top trends, for `GET /api/categories/{slug}`.
+
+    Loads only the requested category instead of building every category summary and
+    discarding all but one.
+    """
     cfg = cfg or default_settings
-    summaries = {item["slug"]: item for item in category_summaries(db, cfg)}
-    category = summaries.get(slug)
+    category = db.execute(select(Category).where(Category.slug == slug)).scalar_one_or_none()
     if category is None:
         return None
 
-    payload = dict(category)
+    topic_counts, article_counts = _category_counts(db)
+    leaders = _category_leaders(db, cfg, category_id=category.id)
+
+    payload = _category_summary(
+        category,
+        topic_counts.get(category.id, 0),
+        article_counts.get(category.id, 0),
+        leaders.get(category.id),
+    )
     payload["top_trends"] = [
         trend_row_as_dict(row) for row in top_trends(db, limit=10, category=slug, cfg=cfg)
     ]
@@ -358,6 +526,7 @@ def get_category(db: Session, slug: str, cfg: Settings | None = None) -> dict | 
 def articles_for_topic(db: Session, topic_id: int, limit: int = 5) -> list[Article]:
     statement = (
         select(Article)
+        .options(*ARTICLE_EAGER_OPTIONS)
         .join(ArticleTopic, ArticleTopic.article_id == Article.id)
         .where(ArticleTopic.topic_id == topic_id)
         .order_by(Article.published_at.desc(), Article.id.desc())
@@ -387,8 +556,3 @@ def trend_row_as_dict(row: TrendRow) -> dict:
         "window_days": row.window_days,
     }
 
-
-def topics_by_ids(db: Session, topic_ids: Sequence[int]) -> list[Topic]:
-    if not topic_ids:
-        return []
-    return list(db.execute(select(Topic).where(Topic.id.in_(list(topic_ids)))).scalars())

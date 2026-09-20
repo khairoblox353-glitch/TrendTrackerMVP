@@ -4,14 +4,11 @@ These model the public wire format only. They are the contract between FastAPI a
 Next.js client, and a change here is a change to `frontend/types/api.ts` too.
 """
 
-from app.schemas.article import ArticleDetail, ArticleListParams, ArticleSummary
+from app.schemas.article import ArticleDetail, ArticleSummary
 from app.schemas.category import CategoryDetail, CategorySummary
 from app.schemas.common import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
-    ErrorDetail,
-    ErrorResponse,
-    MessageResponse,
     ORMModel,
     Page,
 )
@@ -29,16 +26,12 @@ __all__ = [
     "DEFAULT_PAGE_SIZE",
     "MAX_PAGE_SIZE",
     "ArticleDetail",
-    "ArticleListParams",
     "ArticleSummary",
     "CategoryDetail",
     "CategoryRef",
     "CategorySummary",
-    "ErrorDetail",
-    "ErrorResponse",
     "HealthResponse",
     "IngestionRequest",
-    "MessageResponse",
     "ORMModel",
     "Page",
     "RecalculateRequest",

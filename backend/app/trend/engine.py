@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -80,6 +82,16 @@ def _count_articles_by_topic(
     return dict(db.execute(statement).all())
 
 
+def _max_current_count(db: Session, start, end) -> int:
+    """Article count of the busiest topic across *all* topics inside `[start, end)`.
+
+    This is the denominator for volume normalization, so it deliberately ignores any
+    `topic_ids` scope: scoping a run must change which snapshots are written, never the
+    value a snapshot gets.
+    """
+    return max(_count_articles_by_topic(db, start, end).values(), default=0)
+
+
 def score_topics(
     db: Session,
     snapshot_date: date,
@@ -89,8 +101,9 @@ def score_topics(
 ) -> list[TopicScore]:
     """Compute a score for every topic (or the given subset) on one date.
 
-    Volume normalization uses the busiest topic of *this* run as its denominator, so
-    scores from different dates stay comparable (R6).
+    Volume normalization always uses the busiest topic of the whole population for the
+    window, never the busiest topic of `topic_ids`. That keeps a scoped run byte-for-byte
+    comparable with a full run and keeps scores from different dates comparable (R6).
     """
     config = config or default_settings
     window_days = window_days or config.trend_window_days
@@ -110,7 +123,14 @@ def score_topics(
     current_counts = _count_articles_by_topic(db, window.current_start, window.current_end, ids)
     previous_counts = _count_articles_by_topic(db, window.previous_start, window.previous_end, ids)
 
-    max_current = max((current_counts.get(topic_id, 0) for topic_id in ids), default=0)
+    # Volume is normalized against the busiest topic of the *population*, not of the
+    # topics in this run. `topic_ids` only scopes which topics are scored and written;
+    # if the denominator were derived from `current_counts` (the scoped counts), a run
+    # limited to a single topic would force volume_share to 1.0 and `persist_snapshots`
+    # would upsert that inflated score over the correct full-run value. Keeping the
+    # denominator global is what makes a scoped run and a full run produce identical
+    # volume_share and trend_score for the same topic (R6).
+    max_current = _max_current_count(db, window.current_start, window.current_end)
 
     scores: list[TopicScore] = []
     for topic in topics:
@@ -162,44 +182,60 @@ def persist_snapshots(
 ) -> int:
     """Upsert scores into `trend_snapshots`. Returns the number of rows written.
 
-    Upserting (rather than inserting) makes recalculation safe to run repeatedly and
-    is what the `uq_snapshot_topic_date_window` constraint enforces at the DB level.
+    The write is a single dialect-appropriate `INSERT ... ON CONFLICT (...) DO UPDATE`,
+    not a read-then-insert. The previous version selected the existing rows and inserted
+    whichever keys it believed were missing; two overlapping runs (the 6-hourly job
+    against a manual recalculation, or a second replica) could both observe the same key
+    as absent, both INSERT, and the loser raised `IntegrityError` on
+    `uq_snapshot_topic_date_window`. An atomic upsert lets the database resolve the race,
+    so a concurrent writer cannot lose it.
+
+    Being one statement it also stays idempotent: re-running the same date updates each
+    row in place instead of inserting a duplicate.
     """
     scores = list(scores)
     if not scores:
         return 0
 
-    existing = {
-        snapshot.topic_id: snapshot
-        for snapshot in db.execute(
-            select(TrendSnapshot).where(
-                TrendSnapshot.snapshot_date == snapshot_date,
-                TrendSnapshot.window_days == window_days,
-                TrendSnapshot.topic_id.in_([score.topic_id for score in scores]),
-            )
-        ).scalars()
-    }
+    rows = [
+        {
+            "topic_id": score.topic_id,
+            "snapshot_date": snapshot_date,
+            "window_days": window_days,
+            "current_count": score.current_count,
+            "previous_count": score.previous_count,
+            "growth_rate": score.growth_rate,
+            "volume_share": score.volume_share,
+            "trend_score": score.trend_score,
+            "status": score.status,
+            "is_emerging": score.is_emerging,
+        }
+        for score in scores
+    ]
 
-    written = 0
-    for score in scores:
-        snapshot = existing.get(score.topic_id)
-        if snapshot is None:
-            snapshot = TrendSnapshot(topic_id=score.topic_id)
-            db.add(snapshot)
-
-        snapshot.snapshot_date = snapshot_date
-        snapshot.window_days = window_days
-        snapshot.current_count = score.current_count
-        snapshot.previous_count = score.previous_count
-        snapshot.growth_rate = score.growth_rate
-        snapshot.volume_share = score.volume_share
-        snapshot.trend_score = score.trend_score
-        snapshot.status = score.status
-        snapshot.is_emerging = score.is_emerging
-        written += 1
-
+    # Pick the construct from the session's bind so the same code runs on PostgreSQL in
+    # production and on SQLite in the test suite; both support ON CONFLICT DO UPDATE.
+    insert = postgresql_insert if db.get_bind().dialect.name == "postgresql" else sqlite_insert
+    statement = insert(TrendSnapshot).values(rows)
+    statement = statement.on_conflict_do_update(
+        # Explicit target matching `uq_snapshot_topic_date_window`.
+        index_elements=["topic_id", "snapshot_date", "window_days"],
+        set_={
+            "current_count": statement.excluded.current_count,
+            "previous_count": statement.excluded.previous_count,
+            "growth_rate": statement.excluded.growth_rate,
+            "volume_share": statement.excluded.volume_share,
+            "trend_score": statement.excluded.trend_score,
+            "status": statement.excluded.status,
+            "is_emerging": statement.excluded.is_emerging,
+        },
+    )
+    db.execute(statement)
+    # The statement runs in Core, outside the ORM identity map, so a `TrendSnapshot`
+    # already loaded in this session would otherwise keep its pre-upsert values.
+    db.expire_all()
     db.flush()
-    return written
+    return len(rows)
 
 
 def recalculate(

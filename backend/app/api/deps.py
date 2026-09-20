@@ -19,10 +19,6 @@ class Pagination:
     page: int
     page_size: int
 
-    @property
-    def offset(self) -> int:
-        return (self.page - 1) * self.page_size
-
 
 def pagination_params(
     page: int = Query(1, ge=1, description="1-based page number"),

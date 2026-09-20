@@ -55,7 +55,32 @@ docker compose exec backend python -m app.cli seed
 * The `sort` query parameter is validated against a whitelist (`TREND_SORT_FIELDS`,
   `ARTICLE_SORT_FIELDS`). Never interpolate a client string into SQL.
 * `trend_snapshots` is unique per `(topic_id, snapshot_date, window_days)`. Recalculation
-  upserts, so it is safe to re-run.
+  upserts atomically (`ON CONFLICT ... DO UPDATE`, dialect-selected), so it is safe to
+  re-run and two overlapping runs cannot raise a unique violation.
+* **`seed --reset` preserves real ingested data.** Seeded rows are identified by the URL
+  prefix `SEED_URL_PREFIX` (`https://seed.trend-tracker.local/`); `reset_demo_data` deletes
+  only articles with that prefix plus their links, and never deletes topics or categories
+  (shared taxonomy that real articles link to). `seed --reset --include-ingested` is the
+  destructive flag: it wipes every article and every snapshot. Do not make `reset`
+  destructive by default.
+* **A plain `seed` is additive.** It rebuilds snapshot history only on `--reset` or when
+  the database has no snapshots at all (`_has_snapshots`), and it only generates summaries
+  for topics whose `summary IS NULL` (`_fill_missing_summaries`). Both used to overwrite
+  data derived from real articles; do not restore the unconditional versions.
+* **The new `ix_article_topics_topic_id` index needs a manual `CREATE INDEX` on existing
+  databases**: `CREATE INDEX IF NOT EXISTS ix_article_topics_topic_id ON article_topics
+  (topic_id);`. `create_all` only creates missing tables and never ALTERs an existing one,
+  and there is no migration framework by design. A fresh volume gets it automatically.
+* **The volume denominator must stay global.** `volume_share` is normalized against the
+  busiest topic of the whole population (`_max_current_count`), never of a run's
+  `topic_ids`. If a scoped `POST /api/trends/recalculate {"topic_id": N}` used the scoped
+  maximum, it would write `volume_share = 1.0` over the correct score.
+* **API responses must never include raw exception text.** Only our own `CollectorError`
+  messages (written for operators, e.g. `HTTP 404`, `timeout after 15s`) are safe to return
+  and to store in `sources.last_error`. Everything else is replaced: `storage failure` for a
+  failed write, `unexpected error during ingestion` for an unexpected ingestion exception.
+  Generated SQL embeds column names and bound parameter values, so keep the detail in the
+  server log.
 * `GET /api/trends` must be window-scoped; two window sizes for the same topic would
   otherwise duplicate rows in the list.
 * Tests run against SQLite. `services/trends.py` avoids PostgreSQL-only SQL deliberately

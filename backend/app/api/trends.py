@@ -99,7 +99,12 @@ def get_trend(slug: str, db: Session = Depends(get_db)) -> TrendDetail:
 def get_trend_history(
     slug: str,
     response: Response,
-    days: int = Query(30, ge=1, le=365, description="Trailing days to return"),
+    days: int | None = Query(
+        None,
+        ge=1,
+        le=365,
+        description="Trailing days to return (defaults to the configured history length)",
+    ),
     window_days: int | None = Query(None, ge=1, le=90),
     db: Session = Depends(get_db),
 ) -> TrendHistory | Response:

@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
-from sqlalchemy import Select, func, or_, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import Select, func, select
+from sqlalchemy.orm import Session
 
 from app.models import Article, ArticleTopic, Category, Topic
-from app.services.text import normalize_name
-from app.services.trends import ARTICLE_SORT_FIELDS, DEFAULT_ARTICLE_SORT, parse_sort
+from app.services.trends import (
+    ARTICLE_EAGER_OPTIONS,
+    ARTICLE_SORT_FIELDS,
+    DEFAULT_ARTICLE_SORT,
+    apply_category_filter,
+    parse_sort,
+)
+
+
+def _start_of_day(day: date) -> datetime:
+    """Midnight UTC on `day`, timezone-aware so the comparison is unambiguous.
+
+    `Article.published_at` is stored as `TIMESTAMPTZ`, so bounds must carry a timezone.
+    """
+    return datetime.combine(day, time.min, tzinfo=UTC)
 
 
 def _base_query() -> Select:
-    return (
-        select(Article)
-        .options(selectinload(Article.source), selectinload(Article.category), selectinload(Article.topics))
-    )
+    return select(Article).options(*ARTICLE_EAGER_OPTIONS)
 
 
 def _apply_filters(
@@ -31,12 +41,8 @@ def _apply_filters(
     published_before: date | None = None,
 ) -> Select:
     if category:
-        needle = normalize_name(category)
-        statement = statement.join(Category, Category.id == Article.category_id).where(
-            or_(
-                Category.slug == needle.replace(" ", "-"),
-                func.lower(Category.name) == needle,
-            )
+        statement = apply_category_filter(
+            statement.join(Category, Category.id == Article.category_id), category
         )
     if topic:
         statement = statement.join(ArticleTopic, ArticleTopic.article_id == Article.id).join(
@@ -47,9 +53,17 @@ def _apply_filters(
     if query:
         statement = statement.where(Article.title.ilike(f"%{query.strip()}%"))
     if published_after is not None:
-        statement = statement.where(func.date(Article.published_at) >= published_after)
+        # Compare the raw column, not `func.date(published_at)`: wrapping the indexed
+        # column makes the predicate non-sargable and the index is never used.
+        # Semantics are unchanged - the whole of day D is included.
+        statement = statement.where(Article.published_at >= _start_of_day(published_after))
     if published_before is not None:
-        statement = statement.where(func.date(Article.published_at) <= published_before)
+        # `published_at < (D + 1 day)` rather than `<= D`, so the whole of day D is
+        # included while missing precision (timestamps are not midnight) cannot slip
+        # through. This is the equivalent, index-friendly form of `date(col) <= D`.
+        statement = statement.where(
+            Article.published_at < _start_of_day(published_before + timedelta(days=1))
+        )
     return statement
 
 
@@ -122,9 +136,3 @@ def article_as_dict(article: Article) -> dict:
     }
 
 
-def count_articles(db: Session) -> int:
-    return int(db.execute(select(func.count(Article.id))).scalar_one())
-
-
-def latest_published_at(db: Session) -> datetime | None:
-    return db.execute(select(func.max(Article.published_at))).scalar_one()

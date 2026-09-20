@@ -38,10 +38,6 @@ class NotFoundError(AppError):
     code = "not_found"
 
 
-class ConflictError(AppError):
-    status_code = status.HTTP_409_CONFLICT
-    code = "conflict"
-
 
 class ValidationError(AppError):
     # Literal 422 rather than a Starlette constant, which has been renamed across
@@ -49,15 +45,6 @@ class ValidationError(AppError):
     status_code = 422
     code = "validation_error"
 
-
-class UpstreamError(AppError):
-    status_code = status.HTTP_502_BAD_GATEWAY
-    code = "upstream_error"
-
-
-class UnavailableError(AppError):
-    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-    code = "unavailable"
 
 
 def error_body(code: str, message: str, details: dict | None = None) -> dict:

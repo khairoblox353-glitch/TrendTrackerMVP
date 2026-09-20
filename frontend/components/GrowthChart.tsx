@@ -17,10 +17,13 @@ const PADDING = { top: 16, right: 16, bottom: 28, left: 44 };
 
 export function GrowthChart({
   points,
+  windowDays,
   metric = "growth_rate",
   height = HEIGHT,
 }: {
   points: SnapshotPoint[];
+  /** Length of the comparison window, supplied by the API (`TrendHistory.window_days`). */
+  windowDays?: number | null;
   metric?: "growth_rate" | "current_count";
   height?: number;
 }) {
@@ -31,6 +34,15 @@ export function GrowthChart({
       </div>
     );
   }
+
+  // `window_days` can be null for a snapshot series written before the window was recorded,
+  // so the caption degrades to wording that names no number rather than printing "null".
+  const growthCaption =
+    windowDays == null
+      ? "Growth rate per day (current window vs the previous equivalent period)."
+      : `Growth rate per day (current ${windowDays}-day window vs the previous ${windowDays} days).`;
+  const countCaption =
+    windowDays == null ? "Articles per window." : `Articles per ${windowDays}-day window.`;
 
   const values = points.map((point) => (metric === "growth_rate" ? point.growth_rate : point.current_count));
 
@@ -135,9 +147,7 @@ export function GrowthChart({
         )}
       </svg>
       <figcaption className="mt-2 text-xs text-slate-500">
-        {metric === "growth_rate"
-          ? "Growth rate per day (current 7-day window vs the previous 7 days)."
-          : "Articles per 7-day window."}
+        {metric === "growth_rate" ? growthCaption : countCaption}
       </figcaption>
     </figure>
   );

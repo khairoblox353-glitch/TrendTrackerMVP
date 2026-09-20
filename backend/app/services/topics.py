@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.config import settings as default_settings
-from app.models import Article, ArticleTopic, Category, Topic
+from app.models import ArticleTopic, Category, Topic
 from app.services.text import (
     MAX_SLUG_LENGTH,
     MAX_TOPIC_NAME_LENGTH,
@@ -152,25 +152,3 @@ def link_article(db: Session, article_id: int, topic_id: int, confidence: float 
     db.flush()
     return True
 
-
-def topic_article_counts(db: Session, topic_ids: list[int]) -> dict[int, int]:
-    """Total article count per topic, used by the category and detail endpoints."""
-    if not topic_ids:
-        return {}
-    rows = db.execute(
-        select(ArticleTopic.topic_id, func.count(func.distinct(ArticleTopic.article_id)))
-        .where(ArticleTopic.topic_id.in_(topic_ids))
-        .group_by(ArticleTopic.topic_id)
-    ).all()
-    return dict(rows)
-
-
-def latest_articles(db: Session, topic_id: int, limit: int = 5) -> list[Article]:
-    statement = (
-        select(Article)
-        .join(ArticleTopic, ArticleTopic.article_id == Article.id)
-        .where(ArticleTopic.topic_id == topic_id)
-        .order_by(Article.published_at.desc(), Article.id.desc())
-        .limit(limit)
-    )
-    return list(db.execute(statement).unique().scalars())

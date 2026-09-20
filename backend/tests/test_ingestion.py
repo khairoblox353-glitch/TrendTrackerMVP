@@ -119,6 +119,35 @@ class TestSaveArticles:
         assert skipped == 2
         assert len(warnings) == 2
 
+    def test_storage_failure_is_sanitized(self, db: Session, source: Source, monkeypatch):
+        # The exception text from a real PostgreSQL constraint violation contains the
+        # generated INSERT, the column names and the bound parameter values. This warning
+        # is returned by POST /api/ingestion/run, so only a generic message may survive.
+        leak = (
+            "INSERT INTO articles (title, url, published_at) "
+            "VALUES (...) [parameters: ('Doomed', 'https://example.test/doomed')]"
+        )
+
+        def explode(_article):
+            raise RuntimeError(leak)
+
+        # SQLite does not enforce VARCHAR(1000), so the real failure cannot be reproduced
+        # here. Making `Session.add` raise lands on the same per-article failure branch the
+        # nested savepoint takes on PostgreSQL.
+        monkeypatch.setattr(db, "add", explode, raising=False)
+
+        created, _, skipped, warnings = ingestion.save_articles(
+            db, source, [raw("Doomed", "https://example.test/doomed")]
+        )
+
+        assert created == []
+        assert skipped == 1
+        assert warnings == ["storage failure"]
+        for warning in warnings:
+            assert leak not in warning
+            for internal in ("INSERT", "SELECT", "articles", "RuntimeError"):
+                assert internal not in warning
+
 
 class TestClassifyArticle:
     def test_links_a_confident_article_to_a_topic(
@@ -436,6 +465,201 @@ class TestIngestAll:
         assert summary.sources_failed == 1
         assert summary.articles_new == 1
         assert summary.errors[0]["source"] == "Bad"
+
+    def test_unexpected_failure_is_sanitized(
+        self, db: Session, categories, keyword_classifier, monkeypatch
+    ):
+        # An unanticipated exception may carry SQL, filesystem paths or credentials. It
+        # must still fail only its own source, and the client must get a fixed message.
+        source = Source(name="Trap", url="https://trap.test", feed_url="https://trap.test/feed")
+        db.add(source)
+        db.commit()
+
+        secret = 'relation "sources" does not exist at /srv/app/db.py:42'
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError(secret)
+
+        # Force the catch-all in `ingest_all`; `CollectorError` is handled separately.
+        monkeypatch.setattr(ingestion, "ingest_source", explode)
+
+        summary = ingestion.ingest_all(db, classifier=keyword_classifier)
+
+        assert summary.sources_total == 1
+        assert summary.sources_failed == 1
+        assert summary.articles_new == 0
+        assert len(summary.errors) == 1
+        assert summary.errors[0]["source"] == "Trap"
+        assert summary.errors[0]["message"] == "unexpected error during ingestion"
+        assert secret not in summary.errors[0]["message"]
+
+    def test_collector_error_message_still_reaches_the_summary(
+        self, db: Session, categories, keyword_classifier
+    ):
+        # Guard against over-sanitizing: a CollectorError message is authored for
+        # operators and is expected to be useful in the API response and `cli status`.
+        source = Source(name="Missing", url="https://missing.test", feed_url="https://missing.test/feed")
+        db.add(source)
+        db.commit()
+
+        class NotFoundCollector:
+            name = "not-found"
+
+            def collect(self, _source):
+                raise CollectorError("HTTP 404")
+
+            def close(self):
+                return None
+
+        summary = ingestion.ingest_all(
+            db, classifier=keyword_classifier, collector=NotFoundCollector()
+        )
+
+        assert summary.sources_failed == 1
+        assert summary.errors[0]["source"] == "Missing"
+        assert summary.errors[0]["message"] == "HTTP 404"
+        assert db.get(Source, source.id).last_error == "HTTP 404"
+
+    def test_failure_is_durable_for_the_trailing_source(
+        self, db: Session, categories, keyword_classifier
+    ):
+        # Regression: the CollectorError branch only `flush()`ed `last_error`. When the
+        # failing source was the last one in the run, nothing committed it and the
+        # request-scoped session was closed with `db.close()`, which rolled the update
+        # back. `summary.errors` reported the failure but a fresh session saw no trace.
+        source = Source(
+            name="Trailing", url="https://trailing.test", feed_url="https://trailing.test/feed"
+        )
+        db.add(source)
+        db.commit()
+        source_id = source.id
+
+        class LastCollector:
+            name = "last"
+
+            def collect(self, _source):
+                raise CollectorError("HTTP 503")
+
+            def close(self):
+                return None
+
+        summary = ingestion.ingest_all(
+            db, classifier=keyword_classifier, collector=LastCollector()
+        )
+
+        assert summary.sources_failed == 1
+        assert summary.errors[0]["message"] == "HTTP 503"
+
+        # Simulate what `get_db` does when the request ends: it calls `db.close()` on the
+        # request-scoped session, which rolls back any transaction still pending. Without
+        # an explicit commit the flushed `last_error` update dies here, which is exactly
+        # the bug this test pins.
+        db.rollback()
+
+        # A fresh session is what `cli status` and `/api/ingestion/run` use; it can only
+        # see committed state, so reading there is what proves durability.
+        from app.database import SessionLocal
+
+        fresh = SessionLocal()
+        try:
+            stored = fresh.get(Source, source_id)
+            assert stored.last_error == "HTTP 503"
+            assert stored.last_fetched_at is not None
+        finally:
+            fresh.close()
+
+    def test_an_earlier_failure_still_reaches_the_next_source(
+        self, db: Session, categories, keyword_classifier
+    ):
+        # Committing per source must not disturb the run: the second source is still
+        # ingested after the first one fails.
+        bad = Source(name="Bad", url="https://bad2.test", feed_url="https://bad2.test/feed")
+        good = Source(name="Good", url="https://good2.test", feed_url="https://good2.test/feed")
+        db.add_all([bad, good])
+        db.commit()
+
+        class Router:
+            name = "router"
+
+            def collect(self, source):
+                if source.name == "Bad":
+                    raise CollectorError("HTTP 500")
+                return FetchResult(
+                    source_name=source.name,
+                    articles=[raw("Good item", "https://good2.test/1")],
+                )
+
+            def close(self):
+                return None
+
+        from app.database import SessionLocal
+
+        summary = ingestion.ingest_all(db, classifier=keyword_classifier, collector=Router())
+
+        assert summary.sources_ok == 1
+        assert summary.sources_failed == 1
+        assert summary.articles_new == 1
+
+        fresh = SessionLocal()
+        try:
+            assert fresh.get(Source, bad.id).last_error == "HTTP 500"
+            assert fresh.get(Source, good.id).last_error is None
+        finally:
+            fresh.close()
+
+    def test_successful_source_still_stores_and_classifies(
+        self, db: Session, categories, keyword_classifier
+    ):
+        # Guard the explicit commits inside `ingest_source`: the per-source commit added
+        # to `ingest_all` must not change what a successful run persists (spec 15).
+        source = Source(name="Healthy", url="https://healthy.test", feed_url="https://healthy.test/feed")
+        db.add(source)
+        db.commit()
+
+        class HealthyCollector:
+            name = "healthy"
+
+            def collect(self, _source):
+                return FetchResult(
+                    source_name=_source.name,
+                    articles=[
+                        raw(
+                            "OpenAI releases a new agent runtime for autonomous tool use",
+                            "https://healthy.test/agent",
+                        ),
+                        raw(
+                            "New AI chip startup raises a Series B round",
+                            "https://healthy.test/chip",
+                        ),
+                    ],
+                )
+
+            def close(self):
+                return None
+
+        summary = ingestion.ingest_all(
+            db, classifier=keyword_classifier, collector=HealthyCollector()
+        )
+
+        assert summary.sources_ok == 1
+        assert summary.articles_new == 2
+        assert summary.articles_classified == 2
+        assert summary.articles_failed == 0
+
+        from app.database import SessionLocal
+
+        fresh = SessionLocal()
+        try:
+            stored = fresh.execute(
+                select(Article).where(Article.url.like("https://healthy.test/%"))
+            ).scalars().all()
+            assert len(stored) == 2
+            assert all(
+                article.processing_status == ProcessingStatus.CLASSIFIED.value
+                for article in stored
+            )
+        finally:
+            fresh.close()
 
     def test_empty_database_is_not_an_error(self, db: Session, keyword_classifier):
         summary = ingestion.ingest_all(db, classifier=keyword_classifier)

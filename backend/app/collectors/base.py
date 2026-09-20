@@ -33,14 +33,6 @@ class RawArticle:
     external_id: str | None = None
     raw: dict = field(default_factory=dict)
 
-    @property
-    def has_title(self) -> bool:
-        return bool(self.title and self.title.strip())
-
-    @property
-    def has_url(self) -> bool:
-        return bool(self.url and self.url.strip())
-
 
 @dataclass(slots=True)
 class FetchResult:

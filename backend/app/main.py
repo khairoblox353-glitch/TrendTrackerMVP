@@ -7,6 +7,7 @@ logic lives in `app/services` and `app/trend` (spec 19.11).
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,7 @@ from app import __version__
 from app.api import api_router
 from app.api.errors import register_exception_handlers
 from app.config import settings
+from app.database import init_db
 from app.scheduler import start_scheduler, stop_scheduler
 
 logging.basicConfig(
@@ -25,9 +27,63 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# A database that is still starting makes the first connection race. Retry briefly so
+# a fresh `docker compose up` converges without relying on a container restart.
+BOOT_DB_ATTEMPTS = 5
+BOOT_DB_RETRY_SECONDS = 3.0
+
+
+def _bootstrap_database(attempts: int = BOOT_DB_ATTEMPTS) -> bool:
+    """Create any missing tables; returns False if the database is unreachable.
+
+    `init_db()` is idempotent (`Base.metadata.create_all` only issues CREATE TABLE for
+    tables that are absent), so calling it on every boot is safe. Deliberately no
+    Alembic or any other migration framework (spec 19.1, "do not over-engineer"):
+    `create_all` is the intended mechanism for this MVP.
+
+    Limitation, by design: `create_all` never ALTERs an existing table. Adding or
+    changing a column therefore does not reach a volume that already holds the old
+    schema. That case still needs a manual ALTER or table rebuild; the API keeps
+    serving the old columns until an operator does it, and `/api/health` cannot detect
+    it, because the table it probes is present.
+
+    A database that is briefly unreachable must not crash the process: a crash loop
+    would restart the whole app (scheduler included) on a transient blip. Instead the
+    failure is logged loudly, the app starts, and `/api/health` reports `503 degraded`
+    until the database recovers. Docker Compose already orders startup with
+    `depends_on: condition: service_healthy`, so this retry loop is a safety net
+    rather than the normal path.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, max(attempts, 1) + 1):
+        try:
+            init_db()
+            if attempt > 1:
+                logger.info("database schema ready after %s attempts", attempt)
+            return True
+        except Exception as exc:  # noqa: BLE001 - a health check must not kill the app
+            last_error = exc
+            if attempt < attempts:
+                logger.warning(
+                    "database unavailable at startup (attempt %s/%s): %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                time.sleep(BOOT_DB_RETRY_SECONDS)
+
+    logger.error(
+        "database unreachable at startup, schema was not created: %s. The API starts "
+        "anyway and /api/health reports 503 degraded until the database is reachable.",
+        last_error,
+    )
+    return False
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    _bootstrap_database()
+
     scheduler = start_scheduler(settings)
     app.state.scheduler = scheduler
     try:

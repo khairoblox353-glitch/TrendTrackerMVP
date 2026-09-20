@@ -22,7 +22,9 @@ Requires Docker Desktop. No local Python or Node needed.
 cp .env.example .env
 docker compose up --build -d
 
-# Create the schema and load the demo dataset (also creates tables on a fresh volume)
+# Load the demo dataset. The backend creates any missing tables at startup, so this
+# step is about DATA, not schema; `seed` also runs `init_db` itself, so it is safe on
+# a brand-new volume too.
 docker compose exec backend python -m app.cli seed
 ```
 
@@ -84,7 +86,7 @@ Automated checks:
 
 ```bash
 cd backend
-.venv/Scripts/python -m pytest -q        # 273 tests
+.venv/Scripts/python -m pytest -q        # 305 tests
 .venv/Scripts/python -m ruff check app tests
 
 cd ../frontend
@@ -124,6 +126,7 @@ Everything tunable lives in `.env` (see `.env.example`). The values that matter 
 | Variable | Default | Purpose |
 |---|---|---|
 | `TREND_WINDOW_DAYS` | `7` | Length of the compared periods |
+| `TREND_HISTORY_DAYS` | `30` | Default `days` on `GET /api/trends/{slug}/history` |
 | `WEIGHT_GROWTH` / `WEIGHT_VOLUME` | `0.7` / `0.3` | Trend score blend (must sum to 1) |
 | `EMERGING_GROWTH_CAP` | `3.0` | Growth ceiling when the previous window is empty |
 | `GROWING_THRESHOLD` | `0.20` | Growth at or above this is `growing` |
@@ -156,9 +159,23 @@ python -m app.cli status          # row counts + pending classification
 python -m app.cli ingest          # fetch feeds, dedupe, store, classify
 python -m app.cli recalculate     # recompute today's snapshots + summaries
 python -m app.cli classify --pending   # retry failed classifications
-python -m app.cli seed            # reseed demo data
-python -m app.cli seed --reset    # rebuild demo data from scratch
+python -m app.cli seed            # add any missing demo data (never overwrites real data)
+python -m app.cli seed --reset    # rebuild the demo dataset; keeps real ingested data
+python -m app.cli seed --reset --include-ingested   # also wipe real articles + snapshots
 ```
+
+### Upgrading an existing database
+
+The application creates any missing tables at startup (`create_all`). That is enough for
+a fresh volume, but `create_all` cannot ALTER an existing table, so the index added after
+the first release must be created by hand on a database that already exists:
+
+```sql
+CREATE INDEX IF NOT EXISTS ix_article_topics_topic_id ON article_topics (topic_id);
+```
+
+A fresh database gets that index automatically. There is no migration framework by design
+(no Alembic), so any future column or index change needs the same manual step.
 
 ### HTTP
 
@@ -226,9 +243,24 @@ change — that is the whole point of the `RawArticle` boundary.
 ## 9. Seed data
 
 `python -m app.cli seed` creates 5 categories, 25 topics (20 curated + an `Other`
-fallback per category), ~250 synthetic articles across 45 days, and 30 days of trend
-snapshots. Snapshots are produced by the **real** trend engine rather than by fabricated
-numbers, so the seeded history cannot drift from the algorithm.
+fallback per category) and ~250 synthetic articles across 45 days. On a fresh database it
+also builds 30 days of trend snapshots; snapshots are produced by the **real** trend
+engine rather than by fabricated numbers, so the seeded history cannot drift from the
+algorithm.
+
+Seeding is additive once the dataset exists, and the taxonomy is never deleted (real
+articles link to those topics). Seeded articles are identified by the URL prefix
+`https://seed.trend-tracker.local/`, a constant in `app/services/seed.py`:
+
+* a plain `seed` only inserts the seeded articles that are missing, rebuilds snapshot
+  history when the database has **no** snapshots yet, and generates summaries only for
+  topics whose `summary` is still empty - so it never overwrites snapshots or summaries
+  that real ingested articles produced;
+* `seed --reset` deletes just the seeded articles (matched by that URL prefix) and their
+  topic links, drops snapshots of topics that are left with no articles at all, and then
+  regenerates the demo dataset; real articles, their topics and their snapshots survive;
+* `seed --reset --include-ingested` additionally wipes every article and snapshot. It is
+  the explicit destructive full wipe, and the only way to remove real ingested data.
 
 Each topic has a momentum multiplier applied to its most recent comparison window, which
 makes the demo charts predictable: `momentum - 1` is the growth rate the engine reports.
