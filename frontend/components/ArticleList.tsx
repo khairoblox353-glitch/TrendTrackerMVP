@@ -1,3 +1,6 @@
+"use client";
+
+import { useI18n } from "@/lib/i18n";
 import type { ArticleDetail } from "@/types/api";
 import { ArticleRow } from "@/components/ArticleRow";
 
@@ -5,14 +8,17 @@ import { ArticleRow } from "@/components/ArticleRow";
 export function ArticleList({
   articles,
   showSummary = false,
-  emptyMessage = "No articles yet.",
+  emptyMessage,
 }: {
   articles: ArticleDetail[];
   showSummary?: boolean;
   emptyMessage?: string;
 }) {
+  const { t } = useI18n();
+  const message = emptyMessage ?? t.common.noArticlesYet;
+
   if (articles.length === 0) {
-    return <p className="py-6 text-sm text-slate-500">{emptyMessage}</p>;
+    return <p className="py-6 text-sm text-slate-500">{message}</p>;
   }
 
   return (

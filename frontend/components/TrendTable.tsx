@@ -1,6 +1,9 @@
+"use client";
+
 import Link from "next/link";
 
 import { formatCount, formatGrowthRate, formatScore } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import type { TrendSummary } from "@/types/api";
 import { TrendStatusBadge } from "@/components/TrendStatusBadge";
 import { VolumeBar } from "@/components/VolumeBar";
@@ -12,18 +15,20 @@ import { VolumeBar } from "@/components/VolumeBar";
  * what they see.
  */
 export function TrendTable({ trends }: { trends: TrendSummary[] }) {
+  const { locale, t } = useI18n();
+
   return (
     <div className="overflow-x-auto">
       <table className="w-full min-w-[720px] border-collapse text-sm">
         <thead>
           <tr className="border-b border-white/10 text-left">
-            <th className="label py-3 pr-4">Trend</th>
-            <th className="label py-3 pr-4">Category</th>
-            <th className="label py-3 pr-4 text-right">Growth</th>
-            <th className="label py-3 pr-4 text-right">Articles</th>
-            <th className="label py-3 pr-4 text-right">Score</th>
-            <th className="label py-3 pr-4">Status</th>
-            <th className="label py-3">Volume</th>
+            <th className="label py-3 pr-4">{t.table.trend}</th>
+            <th className="label py-3 pr-4">{t.table.category}</th>
+            <th className="label py-3 pr-4 text-right">{t.table.growth}</th>
+            <th className="label py-3 pr-4 text-right">{t.table.articles}</th>
+            <th className="label py-3 pr-4 text-right">{t.table.score}</th>
+            <th className="label py-3 pr-4">{t.table.status}</th>
+            <th className="label py-3">{t.table.volume}</th>
           </tr>
         </thead>
         <tbody>
@@ -40,7 +45,7 @@ export function TrendTable({ trends }: { trends: TrendSummary[] }) {
                 </Link>
               </td>
               <td className="tabular py-3 pr-4 text-right">{formatGrowthRate(trend.growth_rate)}</td>
-              <td className="tabular py-3 pr-4 text-right">{formatCount(trend.current_count)}</td>
+              <td className="tabular py-3 pr-4 text-right">{formatCount(trend.current_count, locale)}</td>
               <td className="tabular py-3 pr-4 text-right">{formatScore(trend.trend_score)}</td>
               <td className="py-3 pr-4">
                 <TrendStatusBadge status={trend.status} isEmerging={trend.is_emerging} />

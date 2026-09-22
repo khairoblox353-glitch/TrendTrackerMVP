@@ -1,5 +1,8 @@
+"use client";
+
 import Link from "next/link";
 
+import { useI18n } from "@/lib/i18n";
 import type { CategorySummary } from "@/types/api";
 
 /** Category filter chips. Active state is driven by the current route (spec 12). */
@@ -12,11 +15,12 @@ export function CategoryChips({
   activeSlug?: string;
   includeAll?: boolean;
 }) {
+  const { t } = useI18n();
   return (
-    <nav aria-label="Categories" className="flex flex-wrap gap-2">
+    <nav aria-label={t.common.categoriesLabel} className="flex flex-wrap gap-2">
       {includeAll ? (
         <Link href="/trends" className={`chip ${activeSlug ? "" : "chip-active"}`}>
-          All
+          {t.common.all}
         </Link>
       ) : null}
       {categories.map((category) => (

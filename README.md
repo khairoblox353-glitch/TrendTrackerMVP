@@ -72,6 +72,11 @@ API_BASE_URL=http://localhost:8000 npm run dev
 
 Helper scripts: `scripts/dev-backend.ps1`, `scripts/dev-frontend.ps1`.
 
+The dashboard supports English and Vietnamese. The header's EN/VI control stores the
+choice in `localStorage` (`trend-tracker.locale`, default English). Because the server
+cannot read `localStorage`, pages are server-rendered in English and switch to Vietnamese
+after hydration; `<title>`/meta stay English.
+
 ## 3. Verifying the definition of done
 
 With the stack running and seeded:

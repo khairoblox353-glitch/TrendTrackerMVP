@@ -1,6 +1,7 @@
 "use client";
 
 import { ErrorState } from "@/components/ErrorState";
+import { useI18n } from "@/lib/i18n";
 
 /** Route-level error boundary. Renders the API message when one is available. */
 export default function Error({
@@ -10,19 +11,21 @@ export default function Error({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  const { t } = useI18n();
+
   return (
     <div className="space-y-4">
       <ErrorState
-        title="Could not load this page"
+        title={t.errorPage.title}
         message={error.message}
-        hint="The backend may be starting up. Retry in a moment."
+        hint={t.errorPage.hint}
       />
       <button
         type="button"
         onClick={reset}
         className="chip"
       >
-        Try again
+        {t.common.tryAgain}
       </button>
     </div>
   );

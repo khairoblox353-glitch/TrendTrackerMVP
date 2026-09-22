@@ -1,4 +1,8 @@
+"use client";
+
 import Link from "next/link";
+
+import { useI18n } from "@/lib/i18n";
 
 /**
  * Pagination control.
@@ -17,6 +21,8 @@ export function Pagination({
   basePath: string;
   query?: Record<string, string | undefined>;
 }) {
+  const { t } = useI18n();
+
   if (pages <= 1) return null;
 
   const hrefFor = (target: number) => {
@@ -33,28 +39,28 @@ export function Pagination({
   const hasNext = page < pages;
 
   return (
-    <nav className="flex items-center justify-between gap-4 pt-4" aria-label="Pagination">
+    <nav className="flex items-center justify-between gap-4 pt-4" aria-label={t.common.paginationLabel}>
       {hasPrevious ? (
         <Link href={hrefFor(page - 1)} className="chip" rel="prev">
-          &larr; Previous
+          {t.common.previous}
         </Link>
       ) : (
         <span className="chip cursor-not-allowed opacity-40" aria-disabled="true">
-          &larr; Previous
+          {t.common.previous}
         </span>
       )}
 
       <span className="text-sm text-slate-400">
-        Page <span className="tabular">{page}</span> of <span className="tabular">{pages}</span>
+        {t.common.pageOf(page, pages)}
       </span>
 
       {hasNext ? (
         <Link href={hrefFor(page + 1)} className="chip" rel="next">
-          Next &rarr;
+          {t.common.next}
         </Link>
       ) : (
         <span className="chip cursor-not-allowed opacity-40" aria-disabled="true">
-          Next &rarr;
+          {t.common.next}
         </span>
       )}
     </nav>

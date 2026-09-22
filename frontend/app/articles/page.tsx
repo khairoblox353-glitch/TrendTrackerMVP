@@ -1,13 +1,6 @@
-import Link from "next/link";
 import type { Metadata } from "next";
 
-import { ArticleList } from "@/components/ArticleList";
-import { CategoryChips } from "@/components/CategoryChips";
-import { EmptyState } from "@/components/EmptyState";
-import { ErrorState } from "@/components/ErrorState";
-import { Pagination } from "@/components/Pagination";
-import { SearchBox } from "@/components/SearchBox";
-import { SortSelect } from "@/components/SortSelect";
+import { ArticlesView } from "@/components/views/ArticlesView";
 import { getArticles, getCategories, getTrend } from "@/lib/api";
 import type { ArticleSortField } from "@/types/api";
 
@@ -16,14 +9,11 @@ export const metadata: Metadata = {
   description: "Every article ingested by the collector, newest first.",
 };
 
-const SORT_OPTIONS = [
-  { value: "-published_at", label: "Newest first" },
-  { value: "published_at", label: "Oldest first" },
-  { value: "-created_at", label: "Recently ingested" },
-  { value: "title", label: "Title (A–Z)" },
-];
-
-/** Article list page (spec 12). Filtering and paging happen in the API. */
+/**
+ * Article list page (spec 12). Filtering and paging happen in the API.
+ *
+ * Stays a server component for the fetching; the translated copy lives in the client view.
+ */
 export default async function ArticlesPage({
   searchParams,
 }: {
@@ -53,52 +43,14 @@ export default async function ArticlesPage({
   const topicName = topicResult?.ok ? topicResult.data.name : topic;
 
   return (
-    <div className="space-y-6">
-      <div className="space-y-2">
-        <h1 className="text-3xl font-semibold tracking-tight text-white">Articles</h1>
-        <p className="text-slate-400">
-          {topicName
-            ? `Showing articles classified into “${topicName}”.`
-            : "Every article stored from the configured RSS feeds."}
-        </p>
-      </div>
-
-      <CategoryChips categories={categories} activeSlug={category} includeAll />
-
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="w-full sm:max-w-sm">
-          <SearchBox basePath="/articles" placeholder="Search headlines…" />
-        </div>
-        <SortSelect basePath="/articles" options={SORT_OPTIONS} defaultValue="-published_at" />
-      </div>
-
-      {topic ? (
-        <p className="text-sm text-slate-400">
-          Filtered by topic <span className="text-slate-200">{topicName}</span> ·{" "}
-          <Link href="/articles" className="text-accent-soft hover:underline">
-            clear filter
-          </Link>
-        </p>
-      ) : null}
-
-      {!articlesResult.ok ? (
-        <ErrorState title="Could not load articles" message={articlesResult.message} />
-      ) : articlesResult.data.items.length === 0 ? (
-        <EmptyState
-          title="No articles found"
-          description="Run the collector to ingest feeds, or adjust the filters."
-        />
-      ) : (
-        <div className="card">
-          <ArticleList articles={articlesResult.data.items} showSummary />
-          <Pagination
-            page={articlesResult.data.page}
-            pages={articlesResult.data.pages}
-            basePath="/articles"
-            query={{ category, topic, q: query, sort }}
-          />
-        </div>
-      )}
-    </div>
+    <ArticlesView
+      articlesResult={articlesResult}
+      categories={categories}
+      topicName={topicName}
+      category={category}
+      topic={topic}
+      query={query}
+      sort={sort}
+    />
   );
 }

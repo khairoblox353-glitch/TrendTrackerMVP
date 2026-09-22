@@ -1,5 +1,7 @@
+"use client";
+
 import type { TrendStatusValue } from "@/types/api";
-import { STATUS_DESCRIPTIONS, STATUS_LABELS } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 
 /**
  * Status badge.
@@ -28,12 +30,14 @@ export function TrendStatusBadge({
    */
   isEmerging?: boolean;
 }) {
+  const { t } = useI18n();
+
   return (
     <span
       className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STYLES[status]}`}
-      title={STATUS_DESCRIPTIONS[status]}
+      title={t.status.descriptions[status]}
     >
-      {STATUS_LABELS[status]}
+      {t.status.labels[status]}
     </span>
   );
 }

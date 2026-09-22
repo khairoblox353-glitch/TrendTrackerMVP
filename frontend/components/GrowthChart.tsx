@@ -1,3 +1,5 @@
+"use client";
+
 /**
  * Dependency-free trend chart.
  *
@@ -5,10 +7,12 @@
  * as the y-axis label context). A charting library would be the single largest
  * frontend dependency for one line, so the SVG is generated directly (ADR-007).
  *
- * This is a server component: no state, no effects, no event handlers.
+ * It is a client component only because the locale and the dictionary come from a
+ * client hook; it still holds no state, no effects and no event handlers.
  */
 
 import { formatShortDate } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import type { SnapshotPoint } from "@/types/api";
 
 const WIDTH = 720;
@@ -27,10 +31,12 @@ export function GrowthChart({
   metric?: "growth_rate" | "current_count";
   height?: number;
 }) {
+  const { locale, t } = useI18n();
+
   if (points.length === 0) {
     return (
       <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-white/10 text-sm text-slate-500">
-        No history available yet.
+        {t.chart.noHistory}
       </div>
     );
   }
@@ -38,11 +44,9 @@ export function GrowthChart({
   // `window_days` can be null for a snapshot series written before the window was recorded,
   // so the caption degrades to wording that names no number rather than printing "null".
   const growthCaption =
-    windowDays == null
-      ? "Growth rate per day (current window vs the previous equivalent period)."
-      : `Growth rate per day (current ${windowDays}-day window vs the previous ${windowDays} days).`;
+    windowDays == null ? t.chart.growthCaptionNoWindow : t.chart.growthCaption(windowDays);
   const countCaption =
-    windowDays == null ? "Articles per window." : `Articles per ${windowDays}-day window.`;
+    windowDays == null ? t.chart.countCaptionNoWindow : t.chart.countCaption(windowDays);
 
   const values = points.map((point) => (metric === "growth_rate" ? point.growth_rate : point.current_count));
 
@@ -81,9 +85,7 @@ export function GrowthChart({
         className="h-auto w-full"
         role="img"
         aria-label={
-          metric === "growth_rate"
-            ? `Growth rate over ${points.length} days`
-            : `Article count over ${points.length} days`
+          metric === "growth_rate" ? t.chart.ariaGrowth(points.length) : t.chart.ariaCount(points.length)
         }
         preserveAspectRatio="none"
       >
@@ -141,7 +143,7 @@ export function GrowthChart({
               className="fill-slate-500"
               fontSize="11"
             >
-              {formatShortDate(point.date)}
+              {formatShortDate(point.date, locale)}
             </text>
           ) : null,
         )}

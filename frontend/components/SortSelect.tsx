@@ -2,6 +2,8 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 
+import { useI18n } from "@/lib/i18n";
+
 /**
  * Sort selector.
  *
@@ -12,20 +14,22 @@ export function SortSelect({
   basePath,
   options,
   defaultValue,
-  label = "Sort",
+  label,
 }: {
   basePath: string;
   options: { value: string; label: string }[];
   defaultValue: string;
   label?: string;
 }) {
+  const { t } = useI18n();
   const router = useRouter();
   const searchParams = useSearchParams();
   const current = searchParams.get("sort") ?? defaultValue;
+  const resolvedLabel = label ?? t.common.sortLabel;
 
   return (
     <label className="flex items-center gap-2 text-sm text-slate-400">
-      <span className="sr-only sm:not-sr-only">{label}</span>
+      <span className="sr-only sm:not-sr-only">{resolvedLabel}</span>
       <select
         value={current}
         onChange={(event) => {
